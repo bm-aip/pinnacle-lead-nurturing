@@ -478,8 +478,9 @@ def load_contacts() -> dict:
     graph_configured = all([
         os.environ.get("GRAPH_TENANT_ID"),
         os.environ.get("GRAPH_CLIENT_ID"),
-        os.environ.get("GRAPH_PEM_KEY") or os.path.exists(
-            "C:/Users/bharathimeraki/Downloads/PinnacleLeadPoller_key.pem"),
+        (os.environ.get("GRAPH_PEM_CONTENT") or
+         os.environ.get("GRAPH_PEM_KEY") or
+         os.path.exists("C:/Users/bharathimeraki/Downloads/PinnacleLeadPoller_key.pem")),
     ])
 
     if graph_configured:
