@@ -258,15 +258,18 @@ def fetch_lead_by_phone(phone: str) -> Optional[dict]:
         )
         if resp.status_code == 404:
             return None
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            log.warning(f"Sell.do HTTP {resp.status_code} for {phone_clean}: {resp.text[:100]}")
+            return None
         data = resp.json()
         if not data.get("exists", False):
             return None
         return data.get("lead")
+    except requests.exceptions.Timeout:
+        log.warning(f"Timeout for {phone_clean}")
+        return None
     except requests.RequestException as e:
         log.error(f"API error for {phone_clean}: {e}")
-        if hasattr(e, 'response') and e.response is not None:
-            log.error(f"Response body: {e.response.text[:200]}")
         return None
 
 
@@ -521,6 +524,12 @@ def run_poll_cycle():
         return
 
     log.info(f"Polling {len(contacts)} contacts...")
+
+    # Log first API call result for diagnostics
+    _first_phone = next((c.get("phone") for c in contacts.values() if c.get("phone")), None)
+    if _first_phone and is_valid_mobile(_first_phone):
+        _test = fetch_lead_by_phone(_first_phone)
+        log.info(f"Diagnostic — first phone {_first_phone}: {'got lead' if _test else 'no lead returned'}")
 
     # FIX 4: Load already-queued IDs
     queued_ids = load_queued_ids()
