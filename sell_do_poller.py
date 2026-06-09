@@ -265,6 +265,8 @@ def fetch_lead_by_phone(phone: str) -> Optional[dict]:
         return data.get("lead")
     except requests.RequestException as e:
         log.error(f"API error for {phone_clean}: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            log.error(f"Response body: {e.response.text[:200]}")
         return None
 
 
