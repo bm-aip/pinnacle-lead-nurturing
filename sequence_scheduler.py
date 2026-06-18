@@ -380,7 +380,8 @@ def tick():
             ORDER BY next_msg_due_at ASC
             LIMIT 50
         """)
-        due_leads = [dict(row) for row in cur.fetchall()]
+        cols      = [d[0] for d in cur.description]
+        due_leads = [dict(zip(cols, row)) for row in cur.fetchall()]
         cur.close()
         conn.close()
     except Exception as e:

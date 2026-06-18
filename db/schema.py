@@ -13,19 +13,48 @@ Run on startup via init() — safe to call on every deploy.
 
 import os
 import logging
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import urllib.parse
+import pg8000.dbapi
 
 log = logging.getLogger(__name__)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 
+def _parse_db_url(url: str) -> dict:
+    """Parse a postgres:// or postgresql:// URL into pg8000.connect kwargs."""
+    # Railway sometimes uses postgres:// prefix
+    url = url.replace("postgres://", "postgresql://", 1)
+    p = urllib.parse.urlparse(url)
+    return {
+        "host":     p.hostname,
+        "port":     p.port or 5432,
+        "database": p.path.lstrip("/"),
+        "user":     p.username,
+        "password": p.password,
+        "ssl_context": True,   # Railway Postgres requires SSL
+    }
+
+
 def get_conn():
-    """Return a psycopg2 connection to the poller Postgres."""
+    """Return a pg8000 DBAPI connection."""
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL env var not set")
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    kwargs = _parse_db_url(DATABASE_URL)
+    return pg8000.dbapi.connect(**kwargs)
+
+
+def _to_dict(cursor, row) -> dict:
+    """Convert a pg8000 tuple row to a dict using cursor.description."""
+    if row is None:
+        return {}
+    cols = [d[0] for d in cursor.description]
+    return dict(zip(cols, row))
+
+
+def _fetchone_dict(cursor) -> dict:
+    row = cursor.fetchone()
+    return _to_dict(cursor, row) if row else {}
 
 
 def init():
@@ -94,6 +123,9 @@ def init():
 
                 -- Referral
                 referral_sent        BOOLEAN DEFAULT FALSE,
+
+                -- Interest alert (fired once when lead first shows WARM/NEAR_CLOSE signal)
+                interest_alert_sent_at TIMESTAMPTZ,
 
                 -- Last inbound
                 last_reply_text      TEXT,
@@ -235,10 +267,10 @@ def get_lead_state(lead_id: str) -> dict:
     conn = get_conn()
     cur  = conn.cursor()
     cur.execute("SELECT * FROM lead_state WHERE lead_id = %s", (lead_id,))
-    row = cur.fetchone()
+    result = _fetchone_dict(cur)
     cur.close()
     conn.close()
-    return dict(row) if row else {}
+    return result
 
 
 def get_lead_by_phone(phone: str) -> dict:
@@ -248,16 +280,15 @@ def get_lead_by_phone(phone: str) -> dict:
         digits = digits[2:]
     conn = get_conn()
     cur  = conn.cursor()
-    # Match both 10-digit and 91-prefixed stored forms
     cur.execute("""
         SELECT * FROM lead_state
         WHERE phone = %s OR phone = %s
         LIMIT 1
     """, (digits, "91" + digits))
-    row = cur.fetchone()
+    result = _fetchone_dict(cur)
     cur.close()
     conn.close()
-    return dict(row) if row else {}
+    return result
 
 
 def update_lead_state(lead_id: str, updates: dict):
