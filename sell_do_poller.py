@@ -592,6 +592,16 @@ def run_poll_cycle():
 
         write_to_queue(brief)
 
+        # Write to lead_state (Postgres) so the sequence clock can drive this
+        # lead forward. write_to_queue() above stays as a legacy/audit JSONL
+        # trail during the cutover — lead_state is now the real source of truth
+        # that sequence_scheduler.tick() reads from every 30-min cycle.
+        try:
+            from sequence_scheduler import intake_lead
+            intake_lead(brief)
+        except Exception as e:
+            log.error(f"intake_lead failed for {lead_id}: {e}")
+
         # FIX 4: Mark as queued so it won't be re-added next cycle
         if lead_id:
             save_queued_id(lead_id)
@@ -631,6 +641,15 @@ def main():
     )
     while True:
         run_poll_cycle()
+
+        # Sequence clock — checks lead_state for leads due their next message
+        # and sends via WasenderAPI. Runs every cycle, same cadence as intake.
+        try:
+            from sequence_scheduler import tick
+            tick()
+        except Exception as e:
+            log.error(f"sequence_scheduler.tick() failed: {e}")
+
         log.info(f"Sleeping {POLL_INTERVAL_SECONDS//60} min...")
         time.sleep(POLL_INTERVAL_SECONDS)
 

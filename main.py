@@ -20,6 +20,13 @@ def run_poller():
 
 
 if __name__ == "__main__":
+    # Initialise DB schema (lead_state, message_log, inbound_log) — idempotent,
+    # safe to run on every deploy. Must happen before the poller thread or
+    # Flask app start, since both depend on lead_state existing.
+    log.info("Initialising DB schema...")
+    import db.schema as db
+    db.init()
+
     # Start poller in background daemon thread
     poller_thread = threading.Thread(target=run_poller, daemon=True, name="poller")
     poller_thread.start()

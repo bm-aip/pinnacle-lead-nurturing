@@ -1,0 +1,2235 @@
+diff --git a/ab_router.py b/ab_router.py
+index 20ac4a6..7e23c02 100644
+--- a/ab_router.py
++++ b/ab_router.py
+@@ -12,8 +12,11 @@ Active tests:
+ 
+ After 50 responses per variant:
+   - Auto-promote winner (higher reply rate)
+-  - Log result to ab_log.json
+-  - Nurturer reads active_variants.json for current assignments
++  - Log result to ab_log.json (still file-based — low volume, read by Campaign Intelligence)
++  - Variant ASSIGNMENT now lives in lead_state (Postgres) via db.schema —
++    this is the source of truth sequence_scheduler reads from.
++  - record_outcome() still aggregates into ab_log.json / active_variants.json
++    for the Campaign Intelligence weekly summary.
+ """
+ 
+ import os
+@@ -24,9 +27,10 @@ from datetime import datetime, timezone
+ from pathlib import Path
+ from typing import Optional
+ 
+-AB_FILE      = os.environ.get("AB_FILE",      "data/ab_assignments.json")
+-AB_LOG_FILE  = os.environ.get("AB_LOG_FILE",  "data/ab_log.json")
+-VARIANTS_FILE= os.environ.get("VARIANTS_FILE","data/active_variants.json")
++import db.schema as db
++
++AB_LOG_FILE   = os.environ.get("AB_LOG_FILE",   "data/ab_log.json")
++VARIANTS_FILE = os.environ.get("VARIANTS_FILE", "data/active_variants.json")
+ 
+ MIN_SAMPLE = 50  # minimum responses per variant before declaring winner
+ 
+@@ -34,6 +38,26 @@ logging.basicConfig(level=logging.INFO,
+                     format="%(asctime)s [%(levelname)s] %(message)s")
+ log = logging.getLogger(__name__)
+ 
++# ── File helpers ──────────────────────────────────────────────────────────────
++# Used only for the low-volume aggregate test-outcome logs (ab_log.json,
++# active_variants.json) — NOT for per-lead variant assignment, which now
++# lives in lead_state (Postgres). See assign_variants()/get_variant() below.
++
++def _load(path: str) -> dict:
++    p = Path(path)
++    p.parent.mkdir(parents=True, exist_ok=True)
++    if not p.exists():
++        return {}
++    try:
++        return json.loads(p.read_text(encoding="utf-8"))
++    except Exception:
++        return {}
++
++def _save(path: str, data: dict):
++    p = Path(path)
++    p.parent.mkdir(parents=True, exist_ok=True)
++    p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
++
+ # ── Test definitions ──────────────────────────────────────────────────────────
+ 
+ TESTS = {
+@@ -54,50 +78,50 @@ TESTS = {
+     },
+ }
+ 
+-# ── File helpers ──────────────────────────────────────────────────────────────
+-
+-def _load(path: str) -> dict:
+-    p = Path(path)
+-    p.parent.mkdir(parents=True, exist_ok=True)
+-    if not p.exists():
+-        return {}
+-    try:
+-        return json.loads(p.read_text(encoding="utf-8"))
+-    except Exception:
+-        return {}
+-
+-def _save(path: str, data: dict):
+-    p = Path(path)
+-    p.parent.mkdir(parents=True, exist_ok=True)
+-    p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+-
+ # ── Variant assignment ────────────────────────────────────────────────────────
+ 
+ def assign_variants(lead_id: str) -> dict:
+     """
+     Assign lead to A or B for each active test.
+-    Assignment is random 50/50 and persisted — same lead always gets same variant.
++    Assignment is random 50/50.
++
++    NOTE: This function only COMPUTES the assignment — it does not write
++    to lead_state itself. sequence_scheduler.intake_lead() takes the returned
++    dict and writes ab_variant_day3 / ab_variant_day1 / ab_variant_visit
++    columns as part of the single upsert_lead_state() call, so there's one
++    write path for new lead intake instead of two.
++
+     Returns {test_id: variant_letter} dict.
+     """
+-    assignments = _load(AB_FILE)
+     lid = str(lead_id)
+ 
+-    if lid not in assignments:
+-        assignments[lid] = {
+-            test_id: random.choice(["A", "B"])
+-            for test_id in TESTS
++    # If lead already exists in lead_state, reuse its existing assignment
++    # (same lead must always get the same variant).
++    existing = db.get_lead_state(lid)
++    if existing and existing.get("ab_variant_day3"):
++        return {
++            "TEST_DAY3_MESSAGE": existing.get("ab_variant_day3"),
++            "TEST_DAY1_VIDEO":   existing.get("ab_variant_day1"),
++            "TEST_SITE_VISIT":   existing.get("ab_variant_visit"),
+         }
+-        assignments[lid]["assigned_at"] = datetime.now(timezone.utc).isoformat()
+-        _save(AB_FILE, assignments)
+-        log.info(f"AB assigned [{lid}]: {assignments[lid]}")
+ 
+-    return {k: v for k, v in assignments[lid].items() if k in TESTS}
++    assignment = {test_id: random.choice(["A", "B"]) for test_id in TESTS}
++    log.info(f"AB assigned [{lid}]: {assignment}")
++    return assignment
+ 
+ 
+ def get_variant(lead_id: str, test_id: str) -> Optional[str]:
+-    """Get variant letter (A or B) for a specific test."""
+-    assignments = _load(AB_FILE)
+-    return assignments.get(str(lead_id), {}).get(test_id)
++    """Get variant letter (A or B) for a specific test, reading from lead_state."""
++    lead = db.get_lead_state(str(lead_id))
++    if not lead:
++        return None
++    col_map = {
++        "TEST_DAY3_MESSAGE": "ab_variant_day3",
++        "TEST_DAY1_VIDEO":   "ab_variant_day1",
++        "TEST_SITE_VISIT":   "ab_variant_visit",
++    }
++    col = col_map.get(test_id)
++    return lead.get(col) if col else None
+ 
+ 
+ def get_variant_value(lead_id: str, test_id: str) -> Optional[str]:
+@@ -217,10 +241,12 @@ def get_ab_summary() -> str:
+ 
+ 
+ if __name__ == "__main__":
+-    # Test assignment
++    # Smoke test — NOTE: assign_variants() only computes an assignment.
++    # In production, sequence_scheduler.intake_lead() writes it to lead_state
++    # in the same upsert as the rest of the lead row. Calling assign_variants()
++    # standalone here (with no lead_state row) will just show a fresh random
++    # 50/50 pick each run, not a persisted one.
+     test_id = "TEST_LEAD_001"
+     variants = assign_variants(test_id)
+-    print(f"Assigned variants: {variants}")
+-    print(f"Day 3 message variant: {get_variant_value(test_id, 'TEST_DAY3_MESSAGE')}")
+-    print(f"Day 1 video variant: {get_variant_value(test_id, 'TEST_DAY1_VIDEO')}")
++    print(f"Computed variants (not yet persisted — needs intake_lead()): {variants}")
+     print(get_ab_summary())
+diff --git a/db/__init__.py b/db/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/db/schema.py b/db/schema.py
+new file mode 100644
+index 0000000..04f6175
+--- /dev/null
++++ b/db/schema.py
+@@ -0,0 +1,382 @@
++"""
++db/schema.py
++Pinnacle Block B — Database Schema
++
++Creates three tables in the poller's Postgres instance (idempotent):
++
++  lead_state    — one row per lead; owns the sequence clock
++  message_log   — every outbound message sent (text, video, doc)
++  inbound_log   — every inbound reply with sentiment + routing decision
++
++Run on startup via init() — safe to call on every deploy.
++"""
++
++import os
++import logging
++import psycopg2
++from psycopg2.extras import RealDictCursor
++
++log = logging.getLogger(__name__)
++
++DATABASE_URL = os.environ.get("DATABASE_URL", "")
++
++
++def get_conn():
++    """Return a psycopg2 connection to the poller Postgres."""
++    if not DATABASE_URL:
++        raise RuntimeError("DATABASE_URL env var not set")
++    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
++
++
++def init():
++    """
++    Create all tables if they don't exist.
++    Idempotent — safe to call on every startup.
++    """
++    if not DATABASE_URL:
++        log.warning("DATABASE_URL not set — skipping schema init")
++        return
++
++    try:
++        conn = get_conn()
++        cur  = conn.cursor()
++
++        # ── lead_state ────────────────────────────────────────────────────────
++        cur.execute("""
++            CREATE TABLE IF NOT EXISTS lead_state (
++                lead_id              TEXT PRIMARY KEY,
++                phone                TEXT NOT NULL,
++                name                 TEXT,
++
++                -- Qualifier output
++                track                TEXT NOT NULL,         -- COLD / STUCK / HOLD
++                archetype            TEXT NOT NULL,         -- YIELD_EDUCATED / YIELD_SHOPPER / CASHFLOW_ANCHORED
++                intro_video          TEXT,                  -- V6 / V7
++                language             TEXT DEFAULT 'EN',     -- EN / TA
++                form_position        TEXT,                  -- top / bottom / sticky
++                sell_do_stage        TEXT,
++                lead_age_days        INTEGER DEFAULT 0,
++                near_escalation      BOOLEAN DEFAULT FALSE,
++
++                -- UTM signals
++                utm_source           TEXT,
++                utm_campaign         TEXT,
++                utm_content          TEXT,
++
++                -- A/B variants
++                ab_variant_day3      TEXT,                  -- A / B
++                ab_variant_day1      TEXT,                  -- A / B
++                ab_variant_visit     TEXT,                  -- A / B
++
++                -- Sequence clock
++                entry_date           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++                current_day          INTEGER DEFAULT 1,
++                last_msg_number      INTEGER DEFAULT 0,
++                last_msg_sent_at     TIMESTAMPTZ,
++                next_msg_number      INTEGER DEFAULT 1,
++                next_msg_due_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++
++                -- Score
++                score                INTEGER DEFAULT 10,
++                score_band           TEXT DEFAULT 'COLD',
++
++                -- Status
++                -- active / scheduler / objection_handler / escalated /
++                -- lost / visited / opted_out / post_visit / hold
++                status               TEXT DEFAULT 'active',
++
++                -- Site visit
++                site_visit_booked    BOOLEAN DEFAULT FALSE,
++                site_visit_date      TIMESTAMPTZ,
++                site_visit_type      TEXT,                  -- in-person / virtual
++                reschedule_count     INTEGER DEFAULT 0,
++                site_visit_completed BOOLEAN DEFAULT FALSE,
++
++                -- Referral
++                referral_sent        BOOLEAN DEFAULT FALSE,
++
++                -- Interest alert (fired once when lead first shows WARM/NEAR_CLOSE signal)
++                interest_alert_sent_at TIMESTAMPTZ,
++
++                -- Last inbound
++                last_reply_text      TEXT,
++                last_reply_at        TIMESTAMPTZ,
++                last_sentiment       TEXT,
++
++                -- Timestamps
++                created_at           TIMESTAMPTZ DEFAULT NOW(),
++                updated_at           TIMESTAMPTZ DEFAULT NOW()
++            )
++        """)
++
++        # Index for the tick() query — leads due for next message
++        cur.execute("""
++            CREATE INDEX IF NOT EXISTS idx_lead_state_tick
++            ON lead_state (next_msg_due_at, status)
++            WHERE status = 'active'
++        """)
++
++        # Index for phone lookup (inbound handler)
++        cur.execute("""
++            CREATE INDEX IF NOT EXISTS idx_lead_state_phone
++            ON lead_state (phone)
++        """)
++
++        # ── message_log ───────────────────────────────────────────────────────
++        cur.execute("""
++            CREATE TABLE IF NOT EXISTS message_log (
++                id                   SERIAL PRIMARY KEY,
++                lead_id              TEXT NOT NULL REFERENCES lead_state(lead_id),
++                phone                TEXT NOT NULL,
++                message_number       INTEGER NOT NULL,
++                phase                INTEGER NOT NULL,       -- 1 or 2
++                track                TEXT,
++                archetype            TEXT,
++                text_body            TEXT,
++                video_tag            TEXT,                   -- V1-V7 or NULL
++                video_url            TEXT,
++                has_docs             BOOLEAN DEFAULT FALSE,
++                ab_test_id           TEXT,
++                ab_variant           TEXT,
++                wasender_message_id  TEXT,
++                delivery_status      TEXT DEFAULT 'sent',    -- sent / delivered / failed
++                sent_at              TIMESTAMPTZ DEFAULT NOW()
++            )
++        """)
++
++        cur.execute("""
++            CREATE INDEX IF NOT EXISTS idx_message_log_lead
++            ON message_log (lead_id, sent_at DESC)
++        """)
++
++        # ── inbound_log ───────────────────────────────────────────────────────
++        cur.execute("""
++            CREATE TABLE IF NOT EXISTS inbound_log (
++                id                   SERIAL PRIMARY KEY,
++                lead_id              TEXT NOT NULL,
++                phone                TEXT NOT NULL,
++                message_type         TEXT DEFAULT 'text',    -- text / audio / image / document / video
++                reply_text           TEXT,
++                audio_transcript     TEXT,
++                sentiment            TEXT,
++                routing_decision     TEXT,                   -- continue / accelerate / objection_handler / escalate / mark_lost
++                score_before         INTEGER,
++                score_after          INTEGER,
++                score_delta          INTEGER,
++                received_at          TIMESTAMPTZ DEFAULT NOW()
++            )
++        """)
++
++        cur.execute("""
++            CREATE INDEX IF NOT EXISTS idx_inbound_log_lead
++            ON inbound_log (lead_id, received_at DESC)
++        """)
++
++        conn.commit()
++        cur.close()
++        conn.close()
++        log.info("DB schema initialised (lead_state, message_log, inbound_log)")
++
++    except Exception as e:
++        log.error(f"Schema init failed: {e}")
++        raise
++
++
++# ── Convenience helpers ───────────────────────────────────────────────────────
++
++def upsert_lead_state(data: dict):
++    """
++    Insert or update a lead_state row.
++    data must contain lead_id, phone, track, archetype at minimum.
++    """
++    conn = get_conn()
++    cur  = conn.cursor()
++    cur.execute("""
++        INSERT INTO lead_state (
++            lead_id, phone, name, track, archetype, intro_video, language,
++            form_position, sell_do_stage, lead_age_days, near_escalation,
++            utm_source, utm_campaign, utm_content,
++            ab_variant_day3, ab_variant_day1, ab_variant_visit,
++            entry_date, next_msg_due_at,
++            score, score_band, status
++        ) VALUES (
++            %(lead_id)s, %(phone)s, %(name)s, %(track)s, %(archetype)s,
++            %(intro_video)s, %(language)s, %(form_position)s, %(sell_do_stage)s,
++            %(lead_age_days)s, %(near_escalation)s,
++            %(utm_source)s, %(utm_campaign)s, %(utm_content)s,
++            %(ab_variant_day3)s, %(ab_variant_day1)s, %(ab_variant_visit)s,
++            NOW(), NOW(),
++            10, 'COLD', 'active'
++        )
++        ON CONFLICT (lead_id) DO NOTHING
++    """, {
++        "lead_id":        data.get("lead_id"),
++        "phone":          data.get("phone"),
++        "name":           data.get("name", "Friend"),
++        "track":          data.get("track"),
++        "archetype":      data.get("archetype"),
++        "intro_video":    data.get("intro_video"),
++        "language":       data.get("language", "EN"),
++        "form_position":  data.get("form_position"),
++        "sell_do_stage":  data.get("sell_do_stage"),
++        "lead_age_days":  data.get("lead_age_days", 0),
++        "near_escalation":data.get("near_escalation", False),
++        "utm_source":     data.get("utm_source"),
++        "utm_campaign":   data.get("utm_campaign"),
++        "utm_content":    data.get("utm_content"),
++        "ab_variant_day3":data.get("ab_variant_day3"),
++        "ab_variant_day1":data.get("ab_variant_day1"),
++        "ab_variant_visit":data.get("ab_variant_visit"),
++    })
++    conn.commit()
++    cur.close()
++    conn.close()
++
++
++def get_lead_state(lead_id: str) -> dict:
++    """Fetch a single lead_state row by lead_id."""
++    conn = get_conn()
++    cur  = conn.cursor()
++    cur.execute("SELECT * FROM lead_state WHERE lead_id = %s", (lead_id,))
++    row = cur.fetchone()
++    cur.close()
++    conn.close()
++    return dict(row) if row else {}
++
++
++def get_lead_by_phone(phone: str) -> dict:
++    """Fetch lead_state by phone (10-digit or 91-prefixed)."""
++    digits = "".join(filter(str.isdigit, str(phone)))
++    if digits.startswith("91") and len(digits) == 12:
++        digits = digits[2:]
++    conn = get_conn()
++    cur  = conn.cursor()
++    # Match both 10-digit and 91-prefixed stored forms
++    cur.execute("""
++        SELECT * FROM lead_state
++        WHERE phone = %s OR phone = %s
++        LIMIT 1
++    """, (digits, "91" + digits))
++    row = cur.fetchone()
++    cur.close()
++    conn.close()
++    return dict(row) if row else {}
++
++
++def update_lead_state(lead_id: str, updates: dict):
++    """
++    Patch specific fields on a lead_state row.
++    updates: dict of column→value pairs.
++    """
++    if not updates:
++        return
++    updates["updated_at"] = "NOW()"
++    set_clause = ", ".join(
++        f"{col} = NOW()" if val == "NOW()" else f"{col} = %({col})s"
++        for col, val in updates.items()
++    )
++    params = {k: v for k, v in updates.items() if v != "NOW()"}
++    params["lead_id"] = lead_id
++
++    conn = get_conn()
++    cur  = conn.cursor()
++    cur.execute(f"""
++        UPDATE lead_state SET {set_clause}
++        WHERE lead_id = %(lead_id)s
++    """, params)
++    conn.commit()
++    cur.close()
++    conn.close()
++
++
++def log_message(
++    lead_id: str,
++    phone: str,
++    message_number: int,
++    phase: int,
++    track: str,
++    archetype: str,
++    text_body: str,
++    video_tag: str = None,
++    video_url: str = None,
++    has_docs: bool = False,
++    ab_test_id: str = None,
++    ab_variant: str = None,
++    wasender_message_id: str = None,
++):
++    """Append a row to message_log."""
++    conn = get_conn()
++    cur  = conn.cursor()
++    cur.execute("""
++        INSERT INTO message_log (
++            lead_id, phone, message_number, phase, track, archetype,
++            text_body, video_tag, video_url, has_docs,
++            ab_test_id, ab_variant, wasender_message_id
++        ) VALUES (
++            %(lead_id)s, %(phone)s, %(msg_num)s, %(phase)s, %(track)s, %(archetype)s,
++            %(text_body)s, %(video_tag)s, %(video_url)s, %(has_docs)s,
++            %(ab_test_id)s, %(ab_variant)s, %(wasender_id)s
++        )
++    """, {
++        "lead_id":     lead_id,
++        "phone":       phone,
++        "msg_num":     message_number,
++        "phase":       phase,
++        "track":       track,
++        "archetype":   archetype,
++        "text_body":   text_body,
++        "video_tag":   video_tag,
++        "video_url":   video_url,
++        "has_docs":    has_docs,
++        "ab_test_id":  ab_test_id,
++        "ab_variant":  ab_variant,
++        "wasender_id": wasender_message_id,
++    })
++    conn.commit()
++    cur.close()
++    conn.close()
++
++
++def log_inbound(
++    lead_id: str,
++    phone: str,
++    message_type: str,
++    reply_text: str,
++    sentiment: str,
++    routing_decision: str,
++    score_before: int,
++    score_after: int,
++    audio_transcript: str = None,
++):
++    """Append a row to inbound_log."""
++    conn = get_conn()
++    cur  = conn.cursor()
++    cur.execute("""
++        INSERT INTO inbound_log (
++            lead_id, phone, message_type, reply_text, audio_transcript,
++            sentiment, routing_decision, score_before, score_after, score_delta
++        ) VALUES (
++            %(lead_id)s, %(phone)s, %(msg_type)s, %(reply)s, %(transcript)s,
++            %(sentiment)s, %(routing)s, %(before)s, %(after)s, %(delta)s
++        )
++    """, {
++        "lead_id":    lead_id,
++        "phone":      phone,
++        "msg_type":   message_type,
++        "reply":      reply_text,
++        "transcript": audio_transcript,
++        "sentiment":  sentiment,
++        "routing":    routing_decision,
++        "before":     score_before,
++        "after":      score_after,
++        "delta":      (score_after or 0) - (score_before or 0),
++    })
++    conn.commit()
++    cur.close()
++    conn.close()
++
++
++if __name__ == "__main__":
++    logging.basicConfig(level=logging.INFO)
++    init()
++    print("Schema OK")
+diff --git a/inbound_handler.py b/inbound_handler.py
+index 2f550a8..0062a22 100644
+--- a/inbound_handler.py
++++ b/inbound_handler.py
+@@ -11,6 +11,12 @@ Handles:
+   - Images/docs   → HIGH_INTENT flag → immediate Escalator
+   - Videos        → acknowledge + flag for human review
+ 
++Lead lookup is now by phone via lead_state (Postgres) — db.get_lead_by_phone() —
++instead of the old JSON lead_registry.json file. Every inbound event is logged
++to inbound_log, and lead_state.status is updated according to the routing
++decision so the sequence clock (sequence_scheduler.tick()) picks up the
++correct next action on its next cycle.
++
+ Run as Flask endpoint alongside the main poller.
+ WasenderAPI webhook URL: POST /webhook/inbound
+ """
+@@ -22,6 +28,8 @@ import requests
+ import tempfile
+ from pathlib import Path
+ from flask import Flask, request, jsonify
++
++import db.schema as db
+ from scorer import process_inbound_reply, update_score
+ from ab_router import record_outcome
+ 
+@@ -29,16 +37,8 @@ SARVAM_KEY         = os.environ.get("SARVAM_KEY", "")
+ WASENDER_API_KEY   = os.environ.get("WASENDER_API_KEY", "")
+ WASENDER_SESSION   = os.environ.get("WASENDER_SESSION_ID", "")
+ WASENDER_BASE_URL  = "https://api.wasenderapi.com/api"
+-SALES_LINE         = os.environ.get("SALES_LINE_PHONE", "919840097140")
+-
+-_DATA_DIR = os.environ.get("DATA_DIR",
+-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data"))
+-os.makedirs(_DATA_DIR, exist_ok=True)
+-
+-QUEUE_PATH         = os.environ.get("QUEUE_PATH",
+-    os.path.join(_DATA_DIR, "pinnacle_lead_queue.jsonl"))
+-INBOUND_LOG        = os.environ.get("INBOUND_LOG",
+-    os.path.join(_DATA_DIR, "inbound_log.jsonl"))
++SALES_LINE         = os.environ.get("SALES_LINE_PHONE",    "919840097140")
++INTEREST_ALERT_PHONE = os.environ.get("INTEREST_ALERT_PHONE", "919042041009")
+ 
+ logging.basicConfig(level=logging.INFO,
+                     format="%(asctime)s [%(levelname)s] %(message)s")
+@@ -46,37 +46,13 @@ log = logging.getLogger(__name__)
+ 
+ app = Flask(__name__)
+ 
+-# ── Lead registry (phone → lead_id) ──────────────────────────────────────────
++# ── Lead lookup (phone → lead_state row, via Postgres) ───────────────────────
++# Replaces the old JSON lead_registry.json file. A lead only exists here once
++# sequence_scheduler.intake_lead() has run for it.
+ 
+-LEAD_REGISTRY_FILE = os.environ.get("LEAD_REGISTRY_FILE",
+-    os.path.join(_DATA_DIR, "lead_registry.json"))
+-
+-def get_lead_id_from_phone(phone: str) -> str:
+-    """Look up lead_id from phone number."""
+-    try:
+-        registry = json.loads(Path(LEAD_REGISTRY_FILE).read_text())
+-        # Normalise phone
+-        digits = "".join(filter(str.isdigit, str(phone)))
+-        if digits.startswith("91") and len(digits) == 12:
+-            digits = digits[2:]
+-        return registry.get(digits, registry.get(phone, "UNKNOWN"))
+-    except Exception:
+-        return "UNKNOWN"
+-
+-
+-def register_lead(lead_id: str, phone: str):
+-    """Register a lead_id → phone mapping."""
+-    try:
+-        path = Path(LEAD_REGISTRY_FILE)
+-        path.parent.mkdir(parents=True, exist_ok=True)
+-        registry = json.loads(path.read_text()) if path.exists() else {}
+-        digits = "".join(filter(str.isdigit, str(phone)))
+-        if digits.startswith("91") and len(digits) == 12:
+-            digits = digits[2:]
+-        registry[digits] = lead_id
+-        path.write_text(json.dumps(registry, indent=2))
+-    except Exception as e:
+-        log.error(f"Failed to register lead: {e}")
++def get_lead_from_phone(phone: str) -> dict:
++    """Look up the full lead_state row from phone number. Returns {} if not found."""
++    return db.get_lead_by_phone(phone)
+ 
+ # ── Sarvam voice transcription ────────────────────────────────────────────────
+ 
+@@ -175,25 +151,146 @@ def send_whatsapp_text(phone: str, message: str):
+         log.error(f"Failed to send WhatsApp to {phone}: {e}")
+ 
+ 
+-def write_inbound_log(event: dict):
+-    """Append inbound event to log file."""
+-    path = Path(INBOUND_LOG)
+-    path.parent.mkdir(parents=True, exist_ok=True)
+-    with open(path, "a", encoding="utf-8") as f:
+-        f.write(json.dumps(event, ensure_ascii=False) + "\n")
++def _log_and_route(
++    lead: dict,
++    phone: str,
++    msg_type: str,
++    reply_text: str,
++    result: dict,
++    audio_transcript: str = None,
++):
++    """
++    Single place that:
++      1. Writes the inbound event to inbound_log
++      2. Applies the lead_state status transition for the routing decision
++
++    `result` is the dict returned by scorer.process_inbound_reply():
++      {sentiment, score, score_before, band, action, lead_id}
++
++    Routing → lead_state.status mapping:
++      continue           → leave status as "active" (sequence clock keeps going)
++      accelerate         → status stays "active"; next_msg_due_at is NOT
++                            pulled forward here — the next tick() will see
++                            the now-higher score_band and may fast-track if HOT
++      objection_handler   → status = "objection_handler" (Nurturer's normal
++                            sequence pauses; objection-handling agent works
++                            the lead in Paperclip, then a human/agent flips
++                            status back to "active" once resolved)
++      escalate            → status = "escalated" (Escalator owns it now)
++      mark_lost           → status = "lost" (sequence clock stops)
++    """
++    lead_id = lead.get("lead_id", "UNKNOWN")
++
++    db.log_inbound(
++        lead_id=lead_id,
++        phone=phone,
++        message_type=msg_type,
++        reply_text=reply_text,
++        sentiment=result.get("sentiment"),
++        routing_decision=result.get("action"),
++        score_before=result.get("score_before"),
++        score_after=result.get("score"),
++        audio_transcript=audio_transcript,
++    )
++
++    action = result.get("action")
++
++    if not lead_id or lead_id == "UNKNOWN":
++        log.warning(f"_log_and_route: no matching lead_state row for phone {phone} — logged but not routed")
++        return
++
++    if action == "mark_lost":
++        db.update_lead_state(lead_id, {"status": "lost"})
++    elif action == "escalate":
++        db.update_lead_state(lead_id, {"status": "escalated"})
++    elif action == "objection_handler":
++        db.update_lead_state(lead_id, {"status": "objection_handler"})
++    elif action == "accelerate":
++        # Status stays active — score_band is already updated by process_inbound_reply().
++        # The next tick() picks up the new band (HOT fast-tracks to Scheduler).
++        pass
++    # "continue" — no status change needed
++
++    log.info(f"Routed [{lead_id}] action={action} → lead_state.status updated accordingly")
++
++
++# ── Interest alert ────────────────────────────────────────────────────────────
++
++def _notify_if_interested(lead: dict, result: dict, reply_text: str):
++    """
++    Fires ONE WhatsApp alert to INTEREST_ALERT_PHONE when a lead first shows
++    a meaningful positive signal — WARM, NEAR_CLOSE, accelerate, or escalate.
++
++    Dedup: checks lead_state.interest_alert_sent_at. If already set, skips.
++    This means the alert fires at most once per lead, on the first positive
++    reply in the entire nurture lifecycle.
++
++    Alert message format:
++      🔔 INTERESTED LEAD — Pinnacle Block B
++      Lead ID:  [lead_id]
++      Name:     [name]
++      Phone:    +[phone]
++      Signal:   [sentiment] / [action]
++      Score:    [score]
++      Reply:    "[last reply text]"
++    """
++    TRIGGER_SENTIMENTS = {"WARM", "NEAR_CLOSE"}
++    TRIGGER_ACTIONS    = {"accelerate", "escalate"}
++
++    sentiment = result.get("sentiment", "")
++    action    = result.get("action", "")
++
++    # Check trigger condition
++    if sentiment not in TRIGGER_SENTIMENTS and action not in TRIGGER_ACTIONS:
++        return
++
++    lead_id = lead.get("lead_id", "UNKNOWN")
++    if lead_id == "UNKNOWN":
++        return
++
++    # Dedup — only fire once per lead.
++    # Re-fetch fresh from DB (not the stale dict from webhook entry)
++    # so a concurrent webhook can't bypass the check.
++    fresh = db.get_lead_state(lead_id)
++    if fresh.get("interest_alert_sent_at"):
++        log.debug(f"_notify_if_interested: alert already sent for {lead_id} — skipping")
++        return
++
++    name  = lead.get("name", "Unknown")
++    phone = lead.get("phone", "")
++    score = result.get("score", 0)
++
++    message = (
++        f"🔔 INTERESTED LEAD — Pinnacle Block B\n\n"
++        f"Lead ID:  {lead_id}\n"
++        f"Name:     {name}\n"
++        f"Phone:    +{phone}\n"
++        f"Signal:   {sentiment} / {action}\n"
++        f"Score:    {score}\n"
++        f"Reply:    \"{reply_text[:200]}\""
++    )
++
++    try:
++        resp = requests.post(
++            f"{WASENDER_BASE_URL}/send-message",
++            headers={"Authorization": f"Bearer {WASENDER_API_KEY}"},
++            json={
++                "session": WASENDER_SESSION,
++                "to":      INTEREST_ALERT_PHONE,
++                "type":    "text",
++                "text":    {"body": message},
++            },
++            timeout=15,
++        )
++        resp.raise_for_status()
++
++        # Mark alert as sent so it doesn't fire again for this lead
++        db.update_lead_state(lead_id, {"interest_alert_sent_at": "NOW()"})
++        log.info(f"Interest alert sent for {lead_id} ({name}) → {INTEREST_ALERT_PHONE}")
+ 
++    except Exception as e:
++        log.error(f"_notify_if_interested: failed to send alert for {lead_id}: {e}")
+ 
+-def write_routing_queue(action: str, lead_id: str, data: dict):
+-    """Write a routing instruction to the main queue for agents to pick up."""
+-    event = {
+-        "source":    "inbound_handler",
+-        "action":    action,
+-        "lead_id":   lead_id,
+-        "data":      data,
+-        "ts":        __import__("datetime").datetime.utcnow().isoformat(),
+-    }
+-    with open(QUEUE_PATH, "a", encoding="utf-8") as f:
+-        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+ 
+ # ── Webhook endpoint ──────────────────────────────────────────────────────────
+ 
+@@ -223,87 +320,78 @@ def inbound_webhook():
+     # Extract sender phone
+     from_jid = msg.get("from", "")
+     phone    = from_jid.replace("@s.whatsapp.net", "").replace("@c.us", "")
+-    lead_id  = get_lead_id_from_phone(phone)
++    lead     = get_lead_from_phone(phone)
++    lead_id  = lead.get("lead_id", "UNKNOWN")
+     msg_type = msg.get("type", "text")
+ 
+     log.info(f"Inbound [{msg_type}] from {phone} (lead_id={lead_id})")
+ 
+-    event = {
+-        "ts":       __import__("datetime").datetime.utcnow().isoformat(),
+-        "phone":    phone,
+-        "lead_id":  lead_id,
+-        "type":     msg_type,
+-    }
++    final_action = "none"
+ 
+     # ── Text message ──────────────────────────────────────────────────────────
+     if msg_type == "text":
+         reply_text = msg.get("text", {}).get("body", "").strip()
+-        event["text"] = reply_text
+-
+-        # Score + sentiment
+-        result = process_inbound_reply(lead_id, reply_text)
+-        event["sentiment"] = result["sentiment"]
+-        event["action"]    = result["action"]
+-
+-        # Record A/B outcome
+-        record_outcome(lead_id, "TEST_DAY3_MESSAGE",
+-                       "replied" if result["sentiment"] != "OPT_OUT" else "opted_out")
+-
+-        # Route based on action
+-        if result["action"] == "mark_lost":
+-            write_routing_queue("mark_lost", lead_id, {
+-                "reason": "opt_out",
+-                "phone":  phone,
+-                "reply":  reply_text,
+-            })
+-        elif result["action"] == "escalate":
+-            write_routing_queue("escalate", lead_id, {
+-                "trigger":  "near_close_signal",
+-                "phone":    phone,
+-                "reply":    reply_text,
+-                "score":    result["score"],
+-            })
+-        elif result["action"] == "objection_handler":
+-            write_routing_queue("objection_handler", lead_id, {
+-                "phone":     phone,
+-                "reply":     reply_text,
+-                "sentiment": result["sentiment"],
+-            })
+-        elif result["action"] == "accelerate":
+-            write_routing_queue("accelerate", lead_id, {
+-                "phone":  phone,
+-                "score":  result["score"],
+-                "band":   result["band"],
+-            })
+-        # NEUTRAL / continue — no routing action needed, poller handles next step
++
++        if lead_id == "UNKNOWN":
++            # No matching lead_state row for this phone — log raw and stop.
++            # (Most likely: inbound arrived before intake_lead() ran for this
++            # lead, or the number isn't in our pipeline at all.)
++            final_action = "unmatched_phone"
++            db.log_inbound(
++                lead_id=lead_id, phone=phone, message_type="text",
++                reply_text=reply_text, sentiment=None,
++                routing_decision="unmatched_phone",
++                score_before=None, score_after=None,
++            )
++            log.warning(f"Inbound text from unmatched phone {phone} — no lead_state row")
++        else:
++            # Score + sentiment + lead_state update (last_reply_text/at/sentiment)
++            result = process_inbound_reply(lead_id, reply_text)
++            final_action = result["action"]
++
++            # Record A/B outcome
++            record_outcome(lead_id, "TEST_DAY3_MESSAGE",
++                           "replied" if result["sentiment"] != "OPT_OUT" else "opted_out")
++
++            _log_and_route(lead, phone, "text", reply_text, result)
++            _notify_if_interested(lead, result, reply_text)
+ 
+     # ── Voice note ────────────────────────────────────────────────────────────
+     elif msg_type == "audio":
+         audio_url = msg.get("audio", {}).get("url", "")
+-        event["audio_url"] = audio_url
+ 
+         # Transcribe
+         transcript = transcribe_voice_note(audio_url) if audio_url else ""
+-        event["transcript"] = transcript
+ 
+         if transcript:
+-            # Treat transcript as text reply
+-            result = process_inbound_reply(lead_id, transcript)
+-            event["sentiment"] = result["sentiment"]
+-            event["action"]    = result["action"]
+-
+-            write_routing_queue("inbound_voice", lead_id, {
+-                "phone":      phone,
+-                "transcript": transcript,
+-                "sentiment":  result["sentiment"],
+-                "action":     result["action"],
+-            })
++            if lead_id == "UNKNOWN":
++                final_action = "unmatched_phone"
++                db.log_inbound(
++                    lead_id=lead_id, phone=phone, message_type="audio",
++                    reply_text="", sentiment=None,
++                    routing_decision="unmatched_phone",
++                    score_before=None, score_after=None,
++                    audio_transcript=transcript,
++                )
++                log.warning(f"Inbound audio from unmatched phone {phone} — no lead_state row")
++            else:
++                # Treat transcript as text reply
++                result = process_inbound_reply(lead_id, transcript)
++                final_action = result["action"]
++                _log_and_route(lead, phone, "audio", transcript, result,
++                                audio_transcript=transcript)
++                _notify_if_interested(lead, result, transcript)
+         else:
+-            # Transcription failed — flag for human review
+-            write_routing_queue("voice_transcription_failed", lead_id, {
+-                "phone":     phone,
+-                "audio_url": audio_url,
+-            })
++            # Transcription failed — flag for human review, log with no routing
++            final_action = "voice_transcription_failed"
++            db.log_inbound(
++                lead_id=lead_id, phone=phone, message_type="audio",
++                reply_text="", sentiment=None,
++                routing_decision="voice_transcription_failed",
++                score_before=None, score_after=None,
++            )
++            if lead_id != "UNKNOWN":
++                db.update_lead_state(lead_id, {"status": "human_review"})
+             # Send acknowledgement to lead
+             send_whatsapp_text(phone,
+                 "Thanks for the voice note! Give me a moment to listen — "
+@@ -312,12 +400,20 @@ def inbound_webhook():
+     # ── Image or document ─────────────────────────────────────────────────────
+     elif msg_type in ("image", "document"):
+         file_url = msg.get(msg_type, {}).get("url", "")
+-        event["file_url"] = file_url
+-        event["action"]   = "escalate_high_intent"
++        final_action = "escalate_high_intent"
+ 
+         # Sending a document (bank statement, property deed, etc.) = near-close signal
+         update_score(lead_id, "lead_near_close", {"trigger": f"sent_{msg_type}"})
+ 
++        db.log_inbound(
++            lead_id=lead_id, phone=phone, message_type=msg_type,
++            reply_text=f"[sent {msg_type}: {file_url or 'see WhatsApp'}]",
++            sentiment="NEAR_CLOSE", routing_decision="escalate",
++            score_before=None, score_after=None,
++        )
++        if lead_id != "UNKNOWN":
++            db.update_lead_state(lead_id, {"status": "escalated"})
++
+         # Immediate escalation alert to sales line
+         alert = (
+             f"🚨 HIGH INTENT — Pinnacle Block B\n\n"
+@@ -332,25 +428,21 @@ def inbound_webhook():
+             "Thanks for sharing that! Our senior team will review and "
+             "reach out to you shortly.")
+ 
+-        write_routing_queue("escalate", lead_id, {
+-            "trigger":  f"sent_{msg_type}",
+-            "phone":    phone,
+-            "file_url": file_url,
+-        })
+-
+     # ── Video ─────────────────────────────────────────────────────────────────
+     elif msg_type == "video":
+-        event["action"] = "flag_human_review"
+-        write_routing_queue("human_review", lead_id, {
+-            "phone":  phone,
+-            "reason": "lead_sent_video",
+-        })
++        final_action = "flag_human_review"
++        db.log_inbound(
++            lead_id=lead_id, phone=phone, message_type="video",
++            reply_text="[sent video]", sentiment=None,
++            routing_decision="human_review",
++            score_before=None, score_after=None,
++        )
++        if lead_id != "UNKNOWN":
++            db.update_lead_state(lead_id, {"status": "human_review"})
+         send_whatsapp_text(phone,
+             "Thanks for sharing! Our team will take a look and get back to you.")
+ 
+-    # ── Log everything ────────────────────────────────────────────────────────
+-    write_inbound_log(event)
+-    return jsonify({"status": "processed", "action": event.get("action", "none")}), 200
++    return jsonify({"status": "processed", "action": final_action}), 200
+ 
+ 
+ @app.route("/health", methods=["GET"])
+diff --git a/main.py b/main.py
+index 892bf6f..d16a5ab 100644
+--- a/main.py
++++ b/main.py
+@@ -20,6 +20,13 @@ def run_poller():
+ 
+ 
+ if __name__ == "__main__":
++    # Initialise DB schema (lead_state, message_log, inbound_log) — idempotent,
++    # safe to run on every deploy. Must happen before the poller thread or
++    # Flask app start, since both depend on lead_state existing.
++    log.info("Initialising DB schema...")
++    import db.schema as db
++    db.init()
++
+     # Start poller in background daemon thread
+     poller_thread = threading.Thread(target=run_poller, daemon=True, name="poller")
+     poller_thread.start()
+diff --git a/message_templates.py b/message_templates.py
+new file mode 100644
+index 0000000..28d5640
+--- /dev/null
++++ b/message_templates.py
+@@ -0,0 +1,449 @@
++"""
++message_templates.py
++Pinnacle Block B — Message Template Lookup
++
++Maps (track, archetype, message_number) to a message payload dict.
++
++Returns:
++{
++    "text":             str,           # WhatsApp message body (EN)
++    "text_ta":          str | None,    # Tamil version (optional)
++    "video_tag":        str | None,    # V1-V7 or None
++    "docs":             bool,          # whether to attach brochure/floor/pricing PDFs
++    "next_day_offset":  int,           # days until next message from today
++    "action":           str,           # "send" | "pass_to_scheduler" | "pass_to_escalator"
++    "action_note":      str | None,    # note to attach when routing to another agent
++    "phase":            int,           # 1 or 2
++    "ab_test":          str | None,    # which A/B test applies (if any)
++}
++
++Video file paths (update when Cloudflare R2 URLs are ready):
++"""
++
++import os
++
++# ── Video URLs ─────────────────────────────────────────────────────────────────
++# Update these when V1-V7 are uploaded to Cloudflare R2.
++# Set as env vars for easy updates without code changes.
++
++VIDEO_URLS = {
++    "V1": os.environ.get("VIDEO_URL_V1", ""),   # FD vs stocks vs senior living
++    "V2": os.environ.get("VIDEO_URL_V2", ""),   # Real net yield on Chennai flat
++    "V3": os.environ.get("VIDEO_URL_V3", ""),   # Who backs the 6% promise
++    "V4": os.environ.get("VIDEO_URL_V4", ""),   # 6-point checklist
++    "V5": os.environ.get("VIDEO_URL_V5", ""),   # Kandigai corridor
++    "V6": os.environ.get("VIDEO_URL_V6", ""),   # Ashwin project intro
++    "V7": os.environ.get("VIDEO_URL_V7", ""),   # Investment video
++}
++
++DOCS_AVAILABLE = os.environ.get("DOCS_AVAILABLE", "false").lower() == "true"
++
++RERA_NUMBER = "TN/35/BUILDING/0565/2024"
++
++
++# ── Template helpers ──────────────────────────────────────────────────────────
++
++def _send(text, text_ta=None, video=None, docs=False, offset=0,
++          phase=1, ab_test=None):
++    return {
++        "text":            text,
++        "text_ta":         text_ta,
++        "video_tag":       video,
++        "video_url":       VIDEO_URLS.get(video) if video else None,
++        "docs":            docs,
++        "next_day_offset": offset,
++        "action":          "send",
++        "action_note":     None,
++        "phase":           phase,
++        "ab_test":         ab_test,
++    }
++
++
++def _scheduler(note, offset=0, phase=1):
++    return {
++        "text":            None,
++        "text_ta":         None,
++        "video_tag":       None,
++        "video_url":       None,
++        "docs":            False,
++        "next_day_offset": offset,
++        "action":          "pass_to_scheduler",
++        "action_note":     note,
++        "phase":           phase,
++        "ab_test":         None,
++    }
++
++
++def _escalator(note, offset=0, phase=1):
++    return {
++        "text":            None,
++        "text_ta":         None,
++        "video_tag":       None,
++        "video_url":       None,
++        "docs":            False,
++        "next_day_offset": offset,
++        "action":          "pass_to_escalator",
++        "action_note":     note,
++        "phase":           phase,
++        "ab_test":         None,
++    }
++
++
++# ── COLD track templates ──────────────────────────────────────────────────────
++
++_COLD_SHARED = {
++    # Day 1 Msg 1 — intent question
++    1: lambda name, **_: _send(
++        text=(
++            f"Hi {name}, thanks for your interest in GTB Pinnacle Block B at Elements Uptown. "
++            f"Before I share anything, one quick question — when you submitted the form, "
++            f"were you looking at this for yourself, for a family member, or purely as an investment? "
++            f"Helps me share the right details."
++        ),
++        offset=0
++    ),
++
++    # Day 1 Msg 2 — intro video (archetype-specific, handled by scheduler)
++    2: lambda name, intro_video="V6", **_: _send(
++        text=(
++            f"A quick 60-second overview of what Pinnacle Block B is and why it exists. "
++            f"Worth a watch, {name} Sir/Madam."
++            if intro_video == "V6" else
++            f"A 60-second breakdown of the investment case for Block B — "
++            f"the numbers, the structure, the why. Have a look, {name} Sir/Madam."
++        ),
++        video=intro_video,
++        offset=0,
++        ab_test="TEST_DAY1_VIDEO"
++    ),
++}
++
++_COLD_YIELD_EDUCATED = {
++    **_COLD_SHARED,
++    # Day 3 — archetype hook
++    3: lambda name, **_: _send(
++        text=(
++            f"{name} Sir/Madam — Block B numbers in brief: ₹43.41 lakh all-in for Type-II. "
++            f"₹21,500 contracted rental every month from Month 3. "
++            f"Net outflow after EMI offset: ₹2,999/month. "
++            f"6% p.a., written into the sale agreement, not market-linked. "
++            f"10% rental step-up at Year 3 built in. "
++            f"Would a 30-minute virtual walkthrough help you get to a clear yes or no faster?"
++        ),
++        offset=3,
++        ab_test="TEST_DAY3_MESSAGE"
++    ),
++    6:  lambda name, **_: _send(text=f"{name} Sir/Madam — this 60-second video runs the FD vs stocks vs senior living comparison at the ₹43L ticket size. Worth watching if you're weighing this against other options.", video="V1", offset=3),
++    9:  lambda name, **_: _send(text=f"{name} Sir/Madam — a lot of projects promise 6%. This video explains exactly who is making the promise at Pinnacle Block B and what the legal structure behind it looks like. 60 seconds.", video="V3", offset=3),
++    13: lambda name, **_: _send(text=f"{name} Sir/Madam — the corridor context for Kandigai. Capital appreciation is not contracted or guaranteed — but the infrastructure story behind this location is worth understanding before you decide.", video="V5", offset=3),
++    17: lambda name, **_: _send(text=f"{name} Sir/Madam — six things to verify before paying for any senior living investment. Worth running this checklist on Block B and on any other project you're comparing.", video="V4", offset=4),
++    21: lambda name, **_: _send(text=f"{name} Sir/Madam — if you're comparing this with a regular Chennai flat for rental income, this 60-second video is directly relevant. Real net yield on a typical flat after costs is closer to 1.66%, not 3%.", video="V2", offset=4),
++    25: lambda name, **_: _scheduler("COLD lead, Day 25. First formal site visit push. Offer in-person and virtual.", offset=0),
++    28: lambda name, **_: _send(
++        text=(
++            f"{name} Sir/Madam — sharing the full project documents for your reference. "
++            f"RERA: {RERA_NUMBER}. "
++            f"If there's one specific thing you'd like clarity on before deciding whether to visit — "
++            f"yield mechanics, location, operator, loan — tell me and I'll answer it directly."
++        ),
++        docs=True,
++        offset=2
++    ),
++}
++
++_COLD_YIELD_SHOPPER = {
++    **_COLD_SHARED,
++    3: lambda name, **_: _send(
++        text=(
++            f"{name} Sir/Madam — one number worth sitting with: 6% p.a. contracted rental yield, "
++            f"monthly disbursement, for 5 years. Not projected. Not market-linked. "
++            f"Written into the sale agreement between you, GTB, and Elements. "
++            f"For context, a typical Chennai South flat at the same ticket size yields 1.66% net after real costs. "
++            f"Would it help to see a side-by-side on WhatsApp?"
++        ),
++        offset=3,
++        ab_test="TEST_DAY3_MESSAGE"
++    ),
++    6:  lambda name, **_: _send(text=f"{name} Sir/Madam — this 60-second video runs the FD vs stocks vs senior living comparison at the ₹43L ticket size. Worth watching if you're weighing this against other options.", video="V1", offset=3),
++    9:  lambda name, **_: _send(text=f"{name} Sir/Madam — a lot of projects promise 6%. This video explains exactly who is making the promise at Pinnacle Block B and what the legal structure behind it looks like. 60 seconds.", video="V3", offset=3),
++    13: lambda name, **_: _send(text=f"{name} Sir/Madam — the corridor context for Kandigai. Capital appreciation is not contracted or guaranteed — but the infrastructure story behind this location is worth understanding before you decide.", video="V5", offset=4),
++    17: lambda name, **_: _send(text=f"{name} Sir/Madam — six things to verify before paying for any senior living investment. Worth running this checklist on Block B and on any other project you're comparing.", video="V4", offset=4),
++    21: lambda name, **_: _send(text=f"{name} Sir/Madam — if you're comparing this with a regular Chennai flat for rental income, this 60-second video is directly relevant. Real net yield on a typical flat after costs is closer to 1.66%, not 3%.", video="V2", offset=4),
++    25: lambda name, **_: _scheduler("COLD lead, Day 25. First formal site visit push. Offer in-person and virtual.", offset=0),
++    28: lambda name, **_: _send(text=f"{name} Sir/Madam — sharing the full project documents for your reference. RERA: {RERA_NUMBER}. If there's one specific thing you'd like clarity on before deciding whether to visit — yield mechanics, location, operator, loan — tell me and I'll answer it directly.", docs=True, offset=2),
++}
++
++_COLD_CASHFLOW_ANCHORED = {
++    **_COLD_SHARED,
++    3: lambda name, **_: _send(
++        text=(
++            f"{name} Sir/Madam — the number that matters most here isn't the gross EMI of ₹24,499. "
++            f"It's ₹2,999 — your net monthly outflow after the ₹21,500 contracted rental offsets the EMI. "
++            f"That's ₹99 a day. "
++            f"You're building ownership of a rent-yielding, RERA-registered asset for less than a daily coffee. "
++            f"Want me to share a one-page breakdown of how this works?"
++        ),
++        offset=3,
++        ab_test="TEST_DAY3_MESSAGE"
++    ),
++    6:  lambda name, **_: _send(text=f"{name} Sir/Madam — this 60-second video runs the FD vs stocks vs senior living comparison at the ₹43L ticket size. The ₹99/day net outflow framing is in here — worth a watch.", video="V1", offset=3),
++    9:  lambda name, **_: _send(text=f"{name} Sir/Madam — who exactly is making the 6% promise at Block B, and what backs it legally. 60 seconds.", video="V3", offset=3),
++    13: lambda name, **_: _send(text=f"{name} Sir/Madam — the corridor context for Kandigai. Capital appreciation is not contracted or guaranteed — but the infrastructure story is real.", video="V5", offset=4),
++    17: lambda name, **_: _send(text=f"{name} Sir/Madam — six things to verify before paying for any senior living investment. Worth running this checklist on Block B and on anything else you're comparing.", video="V4", offset=4),
++    21: lambda name, **_: _send(text=f"{name} Sir/Madam — real net yield on a typical Chennai flat after costs. If you've been comparing Block B's net outflow against self-managed rental income, this 60-second video gives you the honest comparison.", video="V2", offset=4),
++    25: lambda name, **_: _scheduler("COLD lead, Day 25. First formal site visit push. Offer in-person and virtual.", offset=0),
++    28: lambda name, **_: _send(text=f"{name} Sir/Madam — sharing the full project documents for your reference. RERA: {RERA_NUMBER}. If there's one specific blocker — tell me and I'll answer it directly.", docs=True, offset=2),
++}
++
++COLD_TEMPLATES = {
++    "YIELD_EDUCATED":    _COLD_YIELD_EDUCATED,
++    "YIELD_SHOPPER":     _COLD_YIELD_SHOPPER,
++    "CASHFLOW_ANCHORED": _COLD_CASHFLOW_ANCHORED,
++}
++
++
++# ── STUCK track templates ─────────────────────────────────────────────────────
++
++_STUCK_DAY1_BY_OBJECTION = {
++    "thinking_about_it": lambda name, **_: _send(
++        text=(
++            f"{name} Sir/Madam — completely understand, this is a real-estate decision, not an impulse. "
++            f"Two practical suggestions: (a) a 30-minute virtual walkthrough gives your family actual facts "
++            f"to discuss rather than just a brochure; (b) I can share a one-pager formatted for forwarding "
++            f"to your spouse or children. Which would be more useful right now?"
++        ),
++        offset=0
++    ),
++    "send_details": lambda name, **_: _send(
++        text=(
++            f"{name} Sir/Madam — sending the documents now. "
++            f"One thing I'd ask: most leads who say 'I'll revert' don't — simply because the brochure "
++            f"doesn't answer the question that's actually on their mind. "
++            f"So along with these, tell me the one specific thing you want to be sure about — "
++            f"yield, location, operator, loan — and I'll answer it directly."
++        ),
++        docs=True,
++        offset=0
++    ),
++    "emi_concern": lambda name, **_: _send(
++        text=(
++            f"{name} Sir/Madam — on the EMI: the gross number is ₹24,499 (Type-II). "
++            f"But the contracted ₹21,500 monthly rental from Elements offsets this from Month 3. "
++            f"Net outflow: ₹2,999/month — ₹99 a day. "
++            f"If even that doesn't fit, two options: (a) larger down payment to reduce EMI, "
++            f"(b) wait until bandwidth allows. Subject to bank's eligibility check. "
++            f"Would a 30-minute virtual walkthrough help you evaluate the full picture?"
++        ),
++        offset=0
++    ),
++    "lock_in_concern": lambda name, **_: _send(
++        text=(
++            f"{name} Sir/Madam — worth clarifying: the '5-year lock-in' is not a restriction on "
++            f"your money or your right to sell. It is Elements' commitment to pay you rent for 5 years. "
++            f"You can resell any time post-handover — no conditions, no transfer fee. "
++            f"The new owner inherits the remaining rental contract. "
++            f"The 5 years is the yield contract, not a liquidity restriction."
++        ),
++        offset=0
++    ),
++    "location_concern": lambda name, **_: _send(
++        text=(
++            f"{name} Sir/Madam — two things on location. First, a city property at this ticket size "
++            f"with a 6% contracted yield does not exist in Chennai. The ₹37L entry point exists "
++            f"because Kandigai is on the next growth corridor. Second, the senior-living model needs "
++            f"space — quiet, medical on-site, walking distances — which city centres can't offer. "
++            f"Capital appreciation is not contracted or guaranteed, but the infrastructure story "
++            f"is worth seeing firsthand. Would a virtual walkthrough change the picture?"
++        ),
++        offset=0
++    ),
++    "default": lambda name, intro_video="V6", **_: _send(
++        text=f"{name} Sir/Madam — a quick re-share of the Block B overview. Happy to pick up wherever we left off — just let me know what's on your mind.",
++        video=intro_video,
++        offset=0
++    ),
++}
++
++_STUCK_BASE = {
++    3:  lambda name, **_: _COLD_YIELD_EDUCATED[3](name, **_),   # archetype hook reused
++    6:  lambda name, **_: _send(text=f"{name} Sir/Madam — FD vs stocks vs senior living at the same ticket size. Worth a look if you're comparing options.", video="V1", offset=3),
++    9:  lambda name, **_: _send(text=f"{name} Sir/Madam — who exactly is making the 6% promise at Block B, and what backs it legally. 60 seconds.", video="V3", offset=3),
++    13: lambda name, **_: _scheduler("STUCK lead, Day 13. Site visit push. Offer specific tentative slot.", offset=0),
++    17: lambda name, **_: _send(text=f"{name} Sir/Madam — six-point checklist for evaluating any senior living investment. Block B passes all six.", video="V4", offset=4),
++    21: lambda name, **_: _send(text=f"{name} Sir/Madam — real net yield on a typical Chennai flat after costs.", video="V2", offset=4),
++    25: lambda name, **_: _scheduler("STUCK lead, Day 25. Second site visit push. Virtual walkthrough preferred.", offset=0),
++    28: lambda name, **_: _send(text=f"{name} Sir/Madam — sharing the complete project documents. RERA: {RERA_NUMBER}. If there's one specific blocker — yield, location, operator, loan — tell me and I'll answer it directly.", docs=True, offset=2),
++}
++
++STUCK_TEMPLATES = {
++    archetype: {1: _STUCK_DAY1_BY_OBJECTION["default"], **_STUCK_BASE}
++    for archetype in ["YIELD_EDUCATED", "YIELD_SHOPPER", "CASHFLOW_ANCHORED"]
++}
++
++
++# ── HOLD track templates ──────────────────────────────────────────────────────
++
++_HOLD_BASE = {
++    3:  lambda name, **_: _send(text=f"{name} Sir/Madam — following up as promised. Whenever you have 10 minutes, happy to connect on Pinnacle Block B. No rush — just want to make sure you have everything you need when you're ready to look at this properly.", offset=4),
++    7:  lambda name, intro_video="V6", **_: _send(text=f"{name} Sir/Madam — a quick 60-second overview whenever you get a moment.", video=intro_video, offset=6),
++    13: lambda name, **_: _scheduler("HOLD lead, Day 13. Offer virtual walkthrough as low-friction entry.", offset=0),
++    17: lambda name, **_: _send(text=f"{name} Sir/Madam — a 60-second comparison of where ₹43L works hardest over 10 years.", video="V1", offset=4),
++    21: lambda name, **_: _send(text=f"{name} Sir/Madam — the legal structure behind the 6% at Block B. 60 seconds.", video="V3", offset=4),
++    25: lambda name, **_: _scheduler("HOLD lead, Day 25. Second walkthrough push.", offset=0),
++    28: lambda name, **_: _send(text=f"{name} Sir/Madam — the Kandigai corridor. Capital appreciation is not contracted or guaranteed — but the infrastructure is real.", video="V5", offset=2),
++}
++
++HOLD_TEMPLATES = {
++    archetype: dict(_HOLD_BASE)
++    for archetype in ["YIELD_EDUCATED", "YIELD_SHOPPER", "CASHFLOW_ANCHORED"]
++}
++
++
++# ── Phase 2 templates (Day 31–52, all tracks) ─────────────────────────────────
++
++PHASE2_TEMPLATES = {
++    "YIELD_EDUCATED": {
++        31: lambda name, **_: _send(text=f"{name} Sir/Madam — revisiting the 6% structure at Block B. The tripartite agreement between you, GTB, and Elements is the mechanism that backs the contracted rental. Worth a second look if this has been on your mind.", video="V3", offset=7, phase=2),
++        38: lambda name, **_: _send(text=f"{name} Sir/Madam — the 10-year investment comparison at ₹43L. Sharing again as this is the clearest side-by-side of contracted yield versus FD and market-linked options.", video="V1", offset=7, phase=2),
++        45: lambda name, **_: _send(text=f"{name} Sir/Madam — the Kandigai corridor update. Metro construction is progressing. Capital appreciation is not contracted or guaranteed — but the infrastructure is moving on schedule.", video="V5", offset=7, phase=2),
++        52: lambda name, **_: _send(text=f"{name} Sir/Madam — the real net yield on a Chennai flat after costs. If you're still weighing this against a regular rental property, this is the most relevant 60 seconds.", video="V2", offset=0, phase=2),
++    },
++    "YIELD_SHOPPER": {
++        31: lambda name, **_: _send(text=f"{name} Sir/Madam — the 10-year investment math at ₹43L. FD, index funds, and contracted senior living yield side by side. Sharing again as this is the clearest framing of why 6% contracted is a different product from 6% projected.", video="V1", offset=7, phase=2),
++        38: lambda name, **_: _send(text=f"{name} Sir/Madam — who backs the 6% promise at Block B and what the legal structure looks like. The tripartite agreement is what separates a brochure promise from a contractual one.", video="V3", offset=7, phase=2),
++        45: lambda name, **_: _send(text=f"{name} Sir/Madam — real net yield on a regular Chennai rental flat after broker fees, vacancy, maintenance, tax: closer to 1.66%. Directly relevant if you're comparing against a self-managed property.", video="V2", offset=7, phase=2),
++        52: lambda name, **_: _send(text=f"{name} Sir/Madam — the Kandigai corridor in context. Capital appreciation is not contracted or guaranteed — but the infrastructure story behind this location is real.", video="V5", offset=0, phase=2),
++    },
++    "CASHFLOW_ANCHORED": {
++        31: lambda name, **_: _send(text=f"{name} Sir/Madam — the 10-year comparison at ₹43L. The ₹99/day net outflow framing is in here — worth a second watch if the monthly number has been a factor.", video="V1", offset=7, phase=2),
++        38: lambda name, **_: _send(text=f"{name} Sir/Madam — real net yield on a regular Chennai flat. If you've been comparing Block B's net outflow against self-managed rental income, this 60-second video gives you the honest comparison.", video="V2", offset=7, phase=2),
++        45: lambda name, **_: _send(text=f"{name} Sir/Madam — the legal structure behind the ₹21,500 monthly rental at Block B. This is what makes it contracted and not projected.", video="V3", offset=7, phase=2),
++        52: lambda name, **_: _send(text=f"{name} Sir/Madam — six-point checklist for evaluating any senior living investment. Worth running through this for Block B and any other project you're considering.", video="V4", offset=0, phase=2),
++    },
++}
++
++
++# ── Main lookup function ──────────────────────────────────────────────────────
++
++def get_message(
++    track: str,
++    archetype: str,
++    message_number: int,
++    name: str = "Friend",
++    intro_video: str = "V6",
++    language: str = "EN",
++    ab_variant_day3: str = None,
++    ab_variant_day1: str = None,
++    last_objection_type: str = None,
++) -> dict:
++    """
++    Return a message payload for the given lead context.
++
++    For STUCK track Day 1, if last_objection_type is provided,
++    returns the objection-specific refframe message.
++
++    Returns None if no template is defined for this combination.
++    """
++    kwargs = {
++        "name":        name,
++        "intro_video": intro_video,
++        "language":    language,
++    }
++
++    # ── Phase 2 ───────────────────────────────────────────────────────────────
++    if message_number >= 31:
++        phase2 = PHASE2_TEMPLATES.get(archetype, {})
++        fn = phase2.get(message_number)
++        return fn(**kwargs) if fn else None
++
++    # ── Phase 1 ───────────────────────────────────────────────────────────────
++    if track == "COLD":
++        track_map = COLD_TEMPLATES.get(archetype, COLD_TEMPLATES["YIELD_SHOPPER"])
++
++    elif track == "STUCK":
++        if message_number == 1:
++            obj_key = last_objection_type or "default"
++            fn = _STUCK_DAY1_BY_OBJECTION.get(obj_key, _STUCK_DAY1_BY_OBJECTION["default"])
++            return fn(**kwargs)
++        track_map = STUCK_TEMPLATES.get(archetype, STUCK_TEMPLATES["YIELD_SHOPPER"])
++
++    elif track == "HOLD":
++        track_map = HOLD_TEMPLATES.get(archetype, HOLD_TEMPLATES["YIELD_SHOPPER"])
++
++    else:
++        return None
++
++    fn = track_map.get(message_number)
++    if not fn:
++        return None
++
++    payload = fn(**kwargs)
++
++    # Apply A/B variant overrides
++    if message_number == 3 and ab_variant_day3 == "A" and archetype != "CASHFLOW_ANCHORED":
++        # Override to cashflow framing for Variant A
++        cashflow_fn = COLD_TEMPLATES["CASHFLOW_ANCHORED"].get(3)
++        if cashflow_fn:
++            payload = cashflow_fn(**kwargs)
++
++    if message_number == 2 and ab_variant_day1 == "B":
++        # Variant B: always use V7 regardless of UTM
++        payload = _send(
++            text=(
++                f"A 60-second breakdown of the investment case for Block B — "
++                f"the numbers, the structure, the why. Have a look, {name} Sir/Madam."
++            ),
++            video="V7",
++            offset=0,
++            ab_test="TEST_DAY1_VIDEO"
++        )
++
++    return payload
++
++
++def get_next_message_number(track: str, current_msg: int, phase: int) -> int:
++    """
++    Given the current message number, return the next one.
++    Returns 0 when the sequence is complete (no more messages).
++    """
++    if phase == 1:
++        if track == "COLD":
++            sequence = [1, 2, 3, 6, 9, 13, 17, 21, 25, 28]
++        elif track == "STUCK":
++            sequence = [1, 3, 6, 9, 13, 17, 21, 25, 28]
++        elif track == "HOLD":
++            sequence = [3, 7, 13, 17, 21, 25, 28]
++        else:
++            sequence = []
++    else:
++        sequence = [31, 38, 45, 52]
++
++    try:
++        idx = sequence.index(current_msg)
++        return sequence[idx + 1] if idx + 1 < len(sequence) else 0
++    except ValueError:
++        # current_msg not in sequence — return first message after current
++        for n in sequence:
++            if n > current_msg:
++                return n
++        return 0
++
++
++if __name__ == "__main__":
++    # Quick smoke test
++    tests = [
++        ("COLD",  "YIELD_SHOPPER",     1,  "Ramesh"),
++        ("COLD",  "CASHFLOW_ANCHORED", 3,  "Priya"),
++        ("COLD",  "YIELD_EDUCATED",    25, "Sathish"),
++        ("STUCK", "YIELD_SHOPPER",     1,  "Anand"),
++        ("HOLD",  "YIELD_EDUCATED",    13, "Kavitha"),
++        ("COLD",  "YIELD_SHOPPER",     38, "Kumar"),
++    ]
++    for track, arch, msg_num, name in tests:
++        r = get_message(track, arch, msg_num, name=name)
++        if r:
++            action = r["action"]
++            preview = (r["text"] or "")[:80] if r["text"] else f"→ {r['action_note']}"
++            print(f"[{track}/{arch}/msg{msg_num}] {action}: {preview}")
++        else:
++            print(f"[{track}/{arch}/msg{msg_num}] None")
+diff --git a/requirements.txt b/requirements.txt
+index 744d329..85e1a57 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -5,3 +5,4 @@ openpyxl==3.1.5
+ anthropic==0.40.0
+ sarvamai==0.1.0
+ gunicorn==22.0.0
++psycopg2-binary==2.9.9
+diff --git a/scorer.py b/scorer.py
+index 6c4c127..5204d74 100644
+--- a/scorer.py
++++ b/scorer.py
+@@ -2,8 +2,9 @@
+ scorer.py
+ Pinnacle Block B — Lead Scoring + Sentiment Detection
+ 
+-Maintains a score per lead in lead_scores.json.
+-Called by the poller after every inbound WhatsApp event and outbound send.
++Maintains a score per lead in lead_state (Postgres), not a JSON file.
++Called by sequence_scheduler after every outbound send, and by
++inbound_handler after every inbound WhatsApp event.
+ 
+ Score bands:
+   >= 60  HOT    — accelerate sequence, pass to Scheduler sooner
+@@ -19,18 +20,13 @@ Sentiment states (returned by classify_sentiment):
+ """
+ 
+ import os
+-import json
+ import logging
+ import requests
+-from datetime import datetime, timezone
+-from pathlib import Path
+ from typing import Optional
+ 
+-# ── Config ────────────────────────────────────────────────────────────────────
++import db.schema as db
+ 
+ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+-SCORES_FILE       = os.environ.get("SCORES_FILE", "data/lead_scores.json")
+-AB_LOG_FILE       = os.environ.get("AB_LOG_FILE", "data/ab_log.json")
+ 
+ logging.basicConfig(level=logging.INFO,
+                     format="%(asctime)s [%(levelname)s] %(message)s")
+@@ -55,32 +51,18 @@ SCORE_EVENTS = {
+     "reschedule_3":          -20,
+ }
+ 
+-# ── Score store ───────────────────────────────────────────────────────────────
+-
+-def _load_scores() -> dict:
+-    path = Path(SCORES_FILE)
+-    path.parent.mkdir(parents=True, exist_ok=True)
+-    if not path.exists():
+-        return {}
+-    try:
+-        return json.loads(path.read_text(encoding="utf-8"))
+-    except Exception:
+-        return {}
+-
+-
+-def _save_scores(scores: dict):
+-    path = Path(SCORES_FILE)
+-    path.parent.mkdir(parents=True, exist_ok=True)
+-    path.write_text(json.dumps(scores, indent=2, ensure_ascii=False),
+-                    encoding="utf-8")
+-
++# ── Score store (backed by lead_state in Postgres) ────────────────────────────
+ 
+ def get_score(lead_id: str) -> int:
+-    """Return current score for a lead. Default 10 for new leads."""
+-    return _load_scores().get(str(lead_id), {}).get("score", 10)
++    """Return current score for a lead. Default 10 for new/unknown leads."""
++    lead = db.get_lead_state(str(lead_id))
++    return lead.get("score", 10) if lead else 10
+ 
+ 
+ def get_score_band(lead_id: str) -> str:
++    lead = db.get_lead_state(str(lead_id))
++    if lead and lead.get("score_band"):
++        return lead["score_band"]
+     score = get_score(lead_id)
+     if score >= 60: return "HOT"
+     if score >= 30: return "WARM"
+@@ -89,46 +71,44 @@ def get_score_band(lead_id: str) -> str:
+ 
+ def update_score(lead_id: str, event: str, meta: Optional[dict] = None) -> dict:
+     """
+-    Apply a scoring event to a lead.
+-    Returns updated score record.
++    Apply a scoring event to a lead. Reads current score from lead_state,
++    applies the delta, writes the new score + band back.
++
++    Returns {"score": int, "band": str} for the updated lead.
++    If the lead doesn't exist in lead_state yet (e.g. inbound before intake
++    completed), this is a no-op and returns the default record — there's
++    nothing to update until intake_lead() has created the row.
+     """
+-    scores = _load_scores()
+-    lid    = str(lead_id)
+-
+-    if lid not in scores:
+-        scores[lid] = {
+-            "score":      10,
+-            "band":       "COLD",
+-            "events":     [],
+-            "created_at": datetime.now(timezone.utc).isoformat(),
+-            "updated_at": datetime.now(timezone.utc).isoformat(),
+-        }
++    lid  = str(lead_id)
++    lead = db.get_lead_state(lid)
++
++    if not lead:
++        log.warning(f"update_score: {lid} not found in lead_state — skipping")
++        return {"score": 10, "band": "COLD"}
+ 
+     delta = SCORE_EVENTS.get(event, 0)
+-    scores[lid]["score"]  = max(0, scores[lid]["score"] + delta)
+-    scores[lid]["band"]   = (
+-        "HOT"  if scores[lid]["score"] >= 60 else
+-        "WARM" if scores[lid]["score"] >= 30 else
++    new_score = max(0, lead.get("score", 10) + delta)
++    new_band  = (
++        "HOT"  if new_score >= 60 else
++        "WARM" if new_score >= 30 else
+         "COLD"
+     )
+-    scores[lid]["events"].append({
+-        "event":     event,
+-        "delta":     delta,
+-        "score_now": scores[lid]["score"],
+-        "ts":        datetime.now(timezone.utc).isoformat(),
+-        "meta":      meta or {},
++
++    db.update_lead_state(lid, {
++        "score":      new_score,
++        "score_band": new_band,
+     })
+-    scores[lid]["updated_at"] = datetime.now(timezone.utc).isoformat()
+ 
+-    _save_scores(scores)
+-    log.info(f"Score [{lid}] {event} → {delta:+d} = {scores[lid]['score']} ({scores[lid]['band']})")
+-    return scores[lid]
++    log.info(f"Score [{lid}] {event} → {delta:+d} = {new_score} ({new_band})")
++    return {"score": new_score, "band": new_band}
+ 
+ 
+ def get_full_score_record(lead_id: str) -> dict:
+-    return _load_scores().get(str(lead_id), {
+-        "score": 10, "band": "COLD", "events": []
+-    })
++    """Compatibility shim — returns score + band in the old dict shape."""
++    lead = db.get_lead_state(str(lead_id))
++    if not lead:
++        return {"score": 10, "band": "COLD"}
++    return {"score": lead.get("score", 10), "band": lead.get("score_band", "COLD")}
+ 
+ # ── Sentiment detection ───────────────────────────────────────────────────────
+ 
+@@ -204,18 +184,24 @@ def process_inbound_reply(lead_id: str, reply_text: str) -> dict:
+     Full pipeline for an inbound reply:
+     1. Classify sentiment
+     2. Update score
+-    3. Return routing instruction
++    3. Write last_reply_text / last_reply_at / last_sentiment to lead_state
++    4. Return routing instruction
+ 
+     Returns:
+     {
+-        "sentiment":   "WARM" | "NEUTRAL" | "COLD_OBJECTION" | "OPT_OUT" | "NEAR_CLOSE",
+-        "score":       int,
+-        "band":        "HOT" | "WARM" | "COLD",
+-        "action":      "continue" | "accelerate" | "objection_handler" | "escalate" | "mark_lost",
+-        "lead_id":     str,
++        "sentiment":    "WARM" | "NEUTRAL" | "COLD_OBJECTION" | "OPT_OUT" | "NEAR_CLOSE",
++        "score":        int,
++        "score_before": int,
++        "band":         "HOT" | "WARM" | "COLD",
++        "action":       "continue" | "accelerate" | "objection_handler" | "escalate" | "mark_lost",
++        "lead_id":      str,
+     }
++
++    NOTE: does not write to inbound_log itself — the caller (inbound_handler)
++    owns that write since it also has the raw message_type / phone context.
+     """
+-    sentiment = classify_sentiment(reply_text, lead_id)
++    score_before = get_score(lead_id)
++    sentiment    = classify_sentiment(reply_text, lead_id)
+ 
+     # Map sentiment → score event
+     event_map = {
+@@ -233,6 +219,13 @@ def process_inbound_reply(lead_id: str, reply_text: str) -> dict:
+ 
+     record = get_full_score_record(lead_id)
+ 
++    # Persist the reply itself + sentiment onto lead_state
++    db.update_lead_state(str(lead_id), {
++        "last_reply_text": reply_text,
++        "last_reply_at":   "NOW()",
++        "last_sentiment":  sentiment,
++    })
++
+     # Determine routing action
+     action_map = {
+         "WARM":           "accelerate"        if record["score"] >= 30 else "continue",
+@@ -243,20 +236,26 @@ def process_inbound_reply(lead_id: str, reply_text: str) -> dict:
+     }
+ 
+     result = {
+-        "sentiment": sentiment,
+-        "score":     record["score"],
+-        "band":      record["band"],
+-        "action":    action_map.get(sentiment, "continue"),
+-        "lead_id":   str(lead_id),
++        "sentiment":    sentiment,
++        "score":        record["score"],
++        "score_before": score_before,
++        "band":         record["band"],
++        "action":       action_map.get(sentiment, "continue"),
++        "lead_id":      str(lead_id),
+     }
+ 
+     log.info(f"Reply processed [{lead_id}]: sentiment={sentiment} "
+-             f"score={record['score']} action={result['action']}")
++             f"score={score_before}→{record['score']} action={result['action']}")
+     return result
+ 
+ 
+ if __name__ == "__main__":
+-    # Quick test
++    # Quick test — NOTE: update_score() and process_inbound_reply() now read/write
++    # lead_state in Postgres. If lead_id "TEST_001" doesn't already exist there
++    # (i.e. intake_lead() was never called for it), update_score() will log a
++    # warning and no-op, and score/band will just stay at the defaults (10/COLD).
++    # This still exercises classify_sentiment() and the routing logic correctly —
++    # it just won't show real score deltas without a real lead_state row.
+     test_replies = [
+         "Ok looks interesting, tell me more about the yield",
+         "Need to think about it, EMI seems high",
+diff --git a/sell_do_poller.py b/sell_do_poller.py
+index b01865f..8e9672e 100644
+--- a/sell_do_poller.py
++++ b/sell_do_poller.py
+@@ -592,6 +592,16 @@ def run_poll_cycle():
+ 
+         write_to_queue(brief)
+ 
++        # Write to lead_state (Postgres) so the sequence clock can drive this
++        # lead forward. write_to_queue() above stays as a legacy/audit JSONL
++        # trail during the cutover — lead_state is now the real source of truth
++        # that sequence_scheduler.tick() reads from every 30-min cycle.
++        try:
++            from sequence_scheduler import intake_lead
++            intake_lead(brief)
++        except Exception as e:
++            log.error(f"intake_lead failed for {lead_id}: {e}")
++
+         # FIX 4: Mark as queued so it won't be re-added next cycle
+         if lead_id:
+             save_queued_id(lead_id)
+@@ -631,6 +641,15 @@ def main():
+     )
+     while True:
+         run_poll_cycle()
++
++        # Sequence clock — checks lead_state for leads due their next message
++        # and sends via WasenderAPI. Runs every cycle, same cadence as intake.
++        try:
++            from sequence_scheduler import tick
++            tick()
++        except Exception as e:
++            log.error(f"sequence_scheduler.tick() failed: {e}")
++
+         log.info(f"Sleeping {POLL_INTERVAL_SECONDS//60} min...")
+         time.sleep(POLL_INTERVAL_SECONDS)
+ 
+diff --git a/sequence_scheduler.py b/sequence_scheduler.py
+new file mode 100644
+index 0000000..c173d74
+--- /dev/null
++++ b/sequence_scheduler.py
+@@ -0,0 +1,477 @@
++"""
++sequence_scheduler.py
++Pinnacle Block B — Sequence Clock
++
++Two functions called from the poller loop:
++
++  intake_lead(brief)  — called once per new qualifying lead
++                        writes to lead_state, assigns A/B, schedules Day 1
++
++  tick()              — called every 30-minute poll cycle
++                        finds leads with next_msg_due_at <= now
++                        sends the correct message via WasenderAPI
++                        advances next_msg_due_at
++
++Also handles:
++  - Score-based pace adjustments (COLD band = +3 days between messages)
++  - HOT band fast-track to Scheduler
++  - Scheduler / Escalator handoffs
++  - 90-day silence rule
++"""
++
++import os
++import logging
++import requests
++from datetime import datetime, timedelta, timezone
++from typing import Optional
++
++import db.schema as db
++from message_templates import get_message, get_next_message_number
++from ab_router import assign_variants, get_variant, record_outcome
++
++log = logging.getLogger(__name__)
++
++WASENDER_API_KEY  = os.environ.get("WASENDER_API_KEY", "")
++WASENDER_SESSION  = os.environ.get("WASENDER_SESSION_ID", "")
++WASENDER_BASE     = "https://api.wasenderapi.com/api"
++
++SALES_LINE        = os.environ.get("SALES_LINE_PHONE",  "919840097140")
++SUSMIN_LINE       = os.environ.get("SUSMIN_PHONE",       "918879036002")
++
++BROCHURE_URL      = os.environ.get("BROCHURE_URL",      "")
++FLOOR_PLAN_URL    = os.environ.get("FLOOR_PLAN_URL",     "")
++PRICING_URL       = os.environ.get("PRICING_URL",        "")
++
++# Extra days added between messages when score band is COLD
++COLD_BAND_EXTRA_DAYS = 3
++
++
++# ── WasenderAPI helpers ───────────────────────────────────────────────────────
++
++def _wa_send_text(phone: str, text: str) -> Optional[str]:
++    """Send a plain text WhatsApp message. Returns wasender message_id or None."""
++    try:
++        resp = requests.post(
++            f"{WASENDER_BASE}/send-message",
++            headers={"Authorization": f"Bearer {WASENDER_API_KEY}"},
++            json={
++                "session": WASENDER_SESSION,
++                "to":      phone,
++                "type":    "text",
++                "text":    {"body": text},
++            },
++            timeout=15,
++        )
++        resp.raise_for_status()
++        data = resp.json()
++        return data.get("message_id") or data.get("id")
++    except Exception as e:
++        log.error(f"WasenderAPI text send failed to {phone}: {e}")
++        return None
++
++
++def _wa_send_video(phone: str, video_url: str, caption: str) -> Optional[str]:
++    """Send a video message with caption."""
++    if not video_url:
++        log.warning(f"Video URL empty for {phone} — skipping video, sending caption as text")
++        return _wa_send_text(phone, caption)
++    try:
++        resp = requests.post(
++            f"{WASENDER_BASE}/send-message",
++            headers={"Authorization": f"Bearer {WASENDER_API_KEY}"},
++            json={
++                "session": WASENDER_SESSION,
++                "to":      phone,
++                "type":    "video",
++                "video":   {"url": video_url, "caption": caption},
++            },
++            timeout=20,
++        )
++        resp.raise_for_status()
++        data = resp.json()
++        return data.get("message_id") or data.get("id")
++    except Exception as e:
++        log.error(f"WasenderAPI video send failed to {phone}: {e}")
++        # Fallback: send caption as text
++        return _wa_send_text(phone, caption)
++
++
++def _wa_send_doc(phone: str, doc_url: str, filename: str, caption: str = "") -> Optional[str]:
++    """Send a document (PDF)."""
++    if not doc_url:
++        return None
++    try:
++        resp = requests.post(
++            f"{WASENDER_BASE}/send-message",
++            headers={"Authorization": f"Bearer {WASENDER_API_KEY}"},
++            json={
++                "session":  WASENDER_SESSION,
++                "to":       phone,
++                "type":     "document",
++                "document": {"url": doc_url, "filename": filename, "caption": caption},
++            },
++            timeout=20,
++        )
++        resp.raise_for_status()
++        data = resp.json()
++        return data.get("message_id") or data.get("id")
++    except Exception as e:
++        log.error(f"WasenderAPI doc send failed to {phone}: {e}")
++        return None
++
++
++def _send_docs(phone: str):
++    """Send brochure, floor plans, and pricing sheet."""
++    if BROCHURE_URL:
++        _wa_send_doc(phone, BROCHURE_URL,   "Pinnacle_Block_B_Brochure.pdf",    "Brochure")
++    if FLOOR_PLAN_URL:
++        _wa_send_doc(phone, FLOOR_PLAN_URL, "Pinnacle_Block_B_Floor_Plans.pdf", "Floor Plans")
++    if PRICING_URL:
++        _wa_send_doc(phone, PRICING_URL,    "Pinnacle_Block_B_Pricing.pdf",     "Pricing Sheet")
++
++
++# ── intake_lead ───────────────────────────────────────────────────────────────
++
++def intake_lead(brief: dict) -> bool:
++    """
++    Called by the poller when a new lead qualifies.
++
++    Writes a row to lead_state.
++    Assigns A/B variants.
++    Sets next_msg_due_at = NOW (Day 1 fires on the very next tick).
++
++    Returns True if lead was new and written, False if already exists.
++    """
++    lead_id = str(brief.get("lead_id", ""))
++    if not lead_id:
++        log.warning("intake_lead: no lead_id in brief — skipping")
++        return False
++
++    # Check if already in lead_state
++    existing = db.get_lead_state(lead_id)
++    if existing:
++        log.debug(f"intake_lead: {lead_id} already in lead_state — skipping")
++        return False
++
++    # Assign A/B variants
++    variants = assign_variants(lead_id)
++
++    data = {
++        "lead_id":          lead_id,
++        "phone":            brief.get("phone", ""),
++        "name":             brief.get("name", "Friend"),
++        "track":            brief.get("track", "COLD"),
++        "archetype":        brief.get("archetype", "YIELD_SHOPPER"),
++        "intro_video":      brief.get("intro_video", "V6"),
++        "language":         brief.get("language", "EN"),
++        "form_position":    brief.get("form_position"),
++        "sell_do_stage":    brief.get("sell_do_stage"),
++        "lead_age_days":    brief.get("lead_age_days", 0),
++        "near_escalation":  brief.get("near_escalation", False),
++        "utm_source":       brief.get("utm_source"),
++        "utm_campaign":     brief.get("utm_campaign"),
++        "utm_content":      brief.get("utm_content"),
++        "ab_variant_day3":  variants.get("TEST_DAY3_MESSAGE"),
++        "ab_variant_day1":  variants.get("TEST_DAY1_VIDEO"),
++        "ab_variant_visit": variants.get("TEST_SITE_VISIT"),
++    }
++
++    db.upsert_lead_state(data)
++    log.info(
++        f"intake_lead: {lead_id} ({data['name']}) | "
++        f"track={data['track']} arch={data['archetype']} "
++        f"ab_d3={data['ab_variant_day3']} ab_d1={data['ab_variant_day1']}"
++    )
++    return True
++
++
++# ── _compute_next_due ─────────────────────────────────────────────────────────
++
++def _compute_next_due(
++    lead: dict,
++    next_msg_number: int,
++    base_offset_days: int,
++) -> datetime:
++    """
++    Compute when the next message should be sent.
++    Adds COLD_BAND_EXTRA_DAYS if the lead's score band is COLD.
++    """
++    extra = COLD_BAND_EXTRA_DAYS if lead.get("score_band") == "COLD" else 0
++    total_offset = base_offset_days + extra
++    return datetime.now(timezone.utc) + timedelta(days=total_offset)
++
++
++# ── _handle_send_result ───────────────────────────────────────────────────────
++
++def _handle_send_result(lead: dict, payload: dict, wasender_id: Optional[str]):
++    """
++    After a message send:
++    - Write to message_log
++    - Advance next_msg_number and next_msg_due_at in lead_state
++    - Update score (message_delivered event)
++    """
++    from scorer import update_score   # import here to avoid circular
++
++    lead_id   = lead["lead_id"]
++    track     = lead["track"]
++    archetype = lead["archetype"]
++    msg_num   = lead["next_msg_number"]
++    phase     = payload.get("phase", 1)
++
++    # Score event
++    score_event = "video_sent" if payload.get("video_tag") else "message_delivered"
++    update_score(lead_id, score_event)
++
++    # A/B outcome logging
++    ab_test = payload.get("ab_test")
++    if ab_test:
++        variant = get_variant(lead_id, ab_test)
++        if variant:
++            record_outcome(lead_id, ab_test, "delivered")
++
++    # Determine next message number
++    next_msg = get_next_message_number(track, msg_num, phase)
++
++    # If phase 1 exhausted, roll into phase 2
++    if next_msg == 0 and phase == 1:
++        next_msg = 31
++        phase = 2
++
++    # Log to message_log
++    db.log_message(
++        lead_id=lead_id,
++        phone=lead["phone"],
++        message_number=msg_num,
++        phase=payload.get("phase", 1),
++        track=track,
++        archetype=archetype,
++        text_body=payload.get("text", ""),
++        video_tag=payload.get("video_tag"),
++        video_url=payload.get("video_url"),
++        has_docs=payload.get("docs", False),
++        ab_test_id=ab_test,
++        ab_variant=get_variant(lead_id, ab_test) if ab_test else None,
++        wasender_message_id=wasender_id,
++    )
++
++    if next_msg == 0:
++        # Sequence complete — set status to hold, no more sends
++        db.update_lead_state(lead_id, {
++            "status":         "hold",
++            "last_msg_number": msg_num,
++            "last_msg_sent_at": "NOW()",
++            "next_msg_number": 0,
++        })
++        log.info(f"tick: {lead_id} sequence complete after msg {msg_num}")
++        return
++
++    # Compute next send time
++    next_due = _compute_next_due(lead, next_msg, payload.get("next_day_offset", 3))
++
++    db.update_lead_state(lead_id, {
++        "last_msg_number":  msg_num,
++        "last_msg_sent_at": "NOW()",
++        "next_msg_number":  next_msg,
++        "next_msg_due_at":  next_due.isoformat(),
++        "current_day":      (datetime.now(timezone.utc) - lead["entry_date"]).days + 1
++                            if lead.get("entry_date") else 1,
++    })
++
++    log.info(
++        f"tick: {lead_id} sent msg {msg_num} → "
++        f"next={next_msg} due={next_due.strftime('%Y-%m-%d %H:%M')} UTC"
++    )
++
++
++# ── _handle_scheduler_handoff ─────────────────────────────────────────────────
++
++def _handle_scheduler_handoff(lead: dict, note: str):
++    """
++    Pass a lead to the Scheduler agent.
++    Updates lead_state status to 'scheduler'.
++    Logs the handoff.
++    """
++    lead_id = lead["lead_id"]
++    db.update_lead_state(lead_id, {
++        "status":          "scheduler",
++        "last_msg_number": lead.get("next_msg_number", 0),
++        "last_msg_sent_at": "NOW()",
++    })
++    log.info(f"tick: {lead_id} → SCHEDULER | {note}")
++
++
++# ── _handle_escalator_handoff ─────────────────────────────────────────────────
++
++def _handle_escalator_handoff(lead: dict, note: str):
++    """
++    Pass a lead to the Escalator agent.
++    Updates lead_state status to 'escalated'.
++    """
++    lead_id = lead["lead_id"]
++    db.update_lead_state(lead_id, {
++        "status":          "escalated",
++        "last_msg_number": lead.get("next_msg_number", 0),
++        "last_msg_sent_at": "NOW()",
++    })
++    log.info(f"tick: {lead_id} → ESCALATOR | {note}")
++
++
++# ── _check_90_day_silence ─────────────────────────────────────────────────────
++
++def _check_90_day_silence(lead: dict) -> bool:
++    """
++    Returns True if the lead has not replied in 90+ days.
++    If so, marks them Lost and stops outreach.
++    """
++    last_reply = lead.get("last_reply_at")
++    entry      = lead.get("entry_date")
++
++    # Use last reply if available, otherwise entry date
++    reference = last_reply or entry
++    if not reference:
++        return False
++
++    if isinstance(reference, str):
++        try:
++            reference = datetime.fromisoformat(reference.replace("Z", "+00:00"))
++        except Exception:
++            return False
++
++    if reference.tzinfo is None:
++        reference = reference.replace(tzinfo=timezone.utc)
++
++    age_days = (datetime.now(timezone.utc) - reference).days
++    if age_days >= 90:
++        db.update_lead_state(lead["lead_id"], {
++            "status": "lost",
++        })
++        log.info(f"tick: {lead['lead_id']} marked Lost — 90-day silence")
++        return True
++
++    return False
++
++
++# ── tick ──────────────────────────────────────────────────────────────────────
++
++def tick():
++    """
++    Main sequence clock. Called every 30-minute poll cycle.
++
++    Scans lead_state for leads with next_msg_due_at <= NOW and status = active.
++    For each due lead:
++      1. Check 90-day silence rule
++      2. HOT band → fast-track to Scheduler
++      3. Fetch message template
++      4. If action=pass_to_scheduler → hand off
++      5. If action=pass_to_escalator → hand off
++      6. If action=send → send via WasenderAPI, advance sequence
++    """
++    if not WASENDER_API_KEY:
++        log.warning("tick: WASENDER_API_KEY not set — skipping")
++        return
++
++    try:
++        conn = db.get_conn()
++        cur  = conn.cursor()
++        cur.execute("""
++            SELECT * FROM lead_state
++            WHERE status = 'active'
++              AND next_msg_due_at <= NOW()
++            ORDER BY next_msg_due_at ASC
++            LIMIT 50
++        """)
++        due_leads = [dict(row) for row in cur.fetchall()]
++        cur.close()
++        conn.close()
++    except Exception as e:
++        log.error(f"tick: DB query failed: {e}")
++        return
++
++    if not due_leads:
++        log.debug("tick: no leads due")
++        return
++
++    log.info(f"tick: {len(due_leads)} lead(s) due for next message")
++
++    for lead in due_leads:
++        lead_id   = lead["lead_id"]
++        name      = lead.get("name", "Friend")
++        phone     = lead.get("phone", "")
++        track     = lead.get("track", "COLD")
++        archetype = lead.get("archetype", "YIELD_SHOPPER")
++        msg_num   = lead.get("next_msg_number", 1)
++        score_band = lead.get("score_band", "COLD")
++
++        if not phone:
++            log.warning(f"tick: {lead_id} has no phone — skipping")
++            continue
++
++        # ── 90-day silence check ───────────────────────────────────────────
++        if _check_90_day_silence(lead):
++            continue
++
++        # ── HOT fast-track ─────────────────────────────────────────────────
++        if score_band == "HOT":
++            _handle_scheduler_handoff(
++                lead,
++                note=f"HOT band (score={lead.get('score')}) — fast-track to scheduler"
++            )
++            continue
++
++        # ── Fetch template ─────────────────────────────────────────────────
++        payload = get_message(
++            track=track,
++            archetype=archetype,
++            message_number=msg_num,
++            name=name,
++            intro_video=lead.get("intro_video", "V6"),
++            language=lead.get("language", "EN"),
++            ab_variant_day3=lead.get("ab_variant_day3"),
++            ab_variant_day1=lead.get("ab_variant_day1"),
++        )
++
++        if payload is None:
++            log.warning(
++                f"tick: {lead_id} no template for "
++                f"track={track} arch={archetype} msg={msg_num} — marking hold"
++            )
++            db.update_lead_state(lead_id, {"status": "hold"})
++            continue
++
++        action = payload.get("action", "send")
++
++        # ── Scheduler handoff ──────────────────────────────────────────────
++        if action == "pass_to_scheduler":
++            _handle_scheduler_handoff(lead, payload.get("action_note", ""))
++            continue
++
++        # ── Escalator handoff ──────────────────────────────────────────────
++        if action == "pass_to_escalator":
++            _handle_escalator_handoff(lead, payload.get("action_note", ""))
++            continue
++
++        # ── Send message ───────────────────────────────────────────────────
++        text      = payload.get("text", "")
++        video_tag = payload.get("video_tag")
++        video_url = payload.get("video_url", "")
++        has_docs  = payload.get("docs", False)
++
++        wasender_id = None
++
++        if video_tag and text:
++            # Send video with caption
++            wasender_id = _wa_send_video(phone, video_url, text)
++        elif text:
++            wasender_id = _wa_send_text(phone, text)
++
++        if has_docs:
++            _send_docs(phone)
++
++        _handle_send_result(lead, payload, wasender_id)
++
++
++if __name__ == "__main__":
++    logging.basicConfig(level=logging.INFO,
++                        format="%(asctime)s [%(levelname)s] %(message)s")
++    log.info("Running tick() manually...")
++    tick()

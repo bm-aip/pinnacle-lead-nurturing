@@ -2,8 +2,9 @@
 scorer.py
 Pinnacle Block B — Lead Scoring + Sentiment Detection
 
-Maintains a score per lead in lead_scores.json.
-Called by the poller after every inbound WhatsApp event and outbound send.
+Maintains a score per lead in lead_state (Postgres), not a JSON file.
+Called by sequence_scheduler after every outbound send, and by
+inbound_handler after every inbound WhatsApp event.
 
 Score bands:
   >= 60  HOT    — accelerate sequence, pass to Scheduler sooner
@@ -19,18 +20,13 @@ Sentiment states (returned by classify_sentiment):
 """
 
 import os
-import json
 import logging
 import requests
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
-# ── Config ────────────────────────────────────────────────────────────────────
+import db.schema as db
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-SCORES_FILE       = os.environ.get("SCORES_FILE", "data/lead_scores.json")
-AB_LOG_FILE       = os.environ.get("AB_LOG_FILE", "data/ab_log.json")
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -55,32 +51,18 @@ SCORE_EVENTS = {
     "reschedule_3":          -20,
 }
 
-# ── Score store ───────────────────────────────────────────────────────────────
-
-def _load_scores() -> dict:
-    path = Path(SCORES_FILE)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _save_scores(scores: dict):
-    path = Path(SCORES_FILE)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(scores, indent=2, ensure_ascii=False),
-                    encoding="utf-8")
-
+# ── Score store (backed by lead_state in Postgres) ────────────────────────────
 
 def get_score(lead_id: str) -> int:
-    """Return current score for a lead. Default 10 for new leads."""
-    return _load_scores().get(str(lead_id), {}).get("score", 10)
+    """Return current score for a lead. Default 10 for new/unknown leads."""
+    lead = db.get_lead_state(str(lead_id))
+    return lead.get("score", 10) if lead else 10
 
 
 def get_score_band(lead_id: str) -> str:
+    lead = db.get_lead_state(str(lead_id))
+    if lead and lead.get("score_band"):
+        return lead["score_band"]
     score = get_score(lead_id)
     if score >= 60: return "HOT"
     if score >= 30: return "WARM"
@@ -89,46 +71,44 @@ def get_score_band(lead_id: str) -> str:
 
 def update_score(lead_id: str, event: str, meta: Optional[dict] = None) -> dict:
     """
-    Apply a scoring event to a lead.
-    Returns updated score record.
-    """
-    scores = _load_scores()
-    lid    = str(lead_id)
+    Apply a scoring event to a lead. Reads current score from lead_state,
+    applies the delta, writes the new score + band back.
 
-    if lid not in scores:
-        scores[lid] = {
-            "score":      10,
-            "band":       "COLD",
-            "events":     [],
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
+    Returns {"score": int, "band": str} for the updated lead.
+    If the lead doesn't exist in lead_state yet (e.g. inbound before intake
+    completed), this is a no-op and returns the default record — there's
+    nothing to update until intake_lead() has created the row.
+    """
+    lid  = str(lead_id)
+    lead = db.get_lead_state(lid)
+
+    if not lead:
+        log.warning(f"update_score: {lid} not found in lead_state — skipping")
+        return {"score": 10, "band": "COLD"}
 
     delta = SCORE_EVENTS.get(event, 0)
-    scores[lid]["score"]  = max(0, scores[lid]["score"] + delta)
-    scores[lid]["band"]   = (
-        "HOT"  if scores[lid]["score"] >= 60 else
-        "WARM" if scores[lid]["score"] >= 30 else
+    new_score = max(0, lead.get("score", 10) + delta)
+    new_band  = (
+        "HOT"  if new_score >= 60 else
+        "WARM" if new_score >= 30 else
         "COLD"
     )
-    scores[lid]["events"].append({
-        "event":     event,
-        "delta":     delta,
-        "score_now": scores[lid]["score"],
-        "ts":        datetime.now(timezone.utc).isoformat(),
-        "meta":      meta or {},
-    })
-    scores[lid]["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-    _save_scores(scores)
-    log.info(f"Score [{lid}] {event} → {delta:+d} = {scores[lid]['score']} ({scores[lid]['band']})")
-    return scores[lid]
+    db.update_lead_state(lid, {
+        "score":      new_score,
+        "score_band": new_band,
+    })
+
+    log.info(f"Score [{lid}] {event} → {delta:+d} = {new_score} ({new_band})")
+    return {"score": new_score, "band": new_band}
 
 
 def get_full_score_record(lead_id: str) -> dict:
-    return _load_scores().get(str(lead_id), {
-        "score": 10, "band": "COLD", "events": []
-    })
+    """Compatibility shim — returns score + band in the old dict shape."""
+    lead = db.get_lead_state(str(lead_id))
+    if not lead:
+        return {"score": 10, "band": "COLD"}
+    return {"score": lead.get("score", 10), "band": lead.get("score_band", "COLD")}
 
 # ── Sentiment detection ───────────────────────────────────────────────────────
 
@@ -204,18 +184,24 @@ def process_inbound_reply(lead_id: str, reply_text: str) -> dict:
     Full pipeline for an inbound reply:
     1. Classify sentiment
     2. Update score
-    3. Return routing instruction
+    3. Write last_reply_text / last_reply_at / last_sentiment to lead_state
+    4. Return routing instruction
 
     Returns:
     {
-        "sentiment":   "WARM" | "NEUTRAL" | "COLD_OBJECTION" | "OPT_OUT" | "NEAR_CLOSE",
-        "score":       int,
-        "band":        "HOT" | "WARM" | "COLD",
-        "action":      "continue" | "accelerate" | "objection_handler" | "escalate" | "mark_lost",
-        "lead_id":     str,
+        "sentiment":    "WARM" | "NEUTRAL" | "COLD_OBJECTION" | "OPT_OUT" | "NEAR_CLOSE",
+        "score":        int,
+        "score_before": int,
+        "band":         "HOT" | "WARM" | "COLD",
+        "action":       "continue" | "accelerate" | "objection_handler" | "escalate" | "mark_lost",
+        "lead_id":      str,
     }
+
+    NOTE: does not write to inbound_log itself — the caller (inbound_handler)
+    owns that write since it also has the raw message_type / phone context.
     """
-    sentiment = classify_sentiment(reply_text, lead_id)
+    score_before = get_score(lead_id)
+    sentiment    = classify_sentiment(reply_text, lead_id)
 
     # Map sentiment → score event
     event_map = {
@@ -233,6 +219,13 @@ def process_inbound_reply(lead_id: str, reply_text: str) -> dict:
 
     record = get_full_score_record(lead_id)
 
+    # Persist the reply itself + sentiment onto lead_state
+    db.update_lead_state(str(lead_id), {
+        "last_reply_text": reply_text,
+        "last_reply_at":   "NOW()",
+        "last_sentiment":  sentiment,
+    })
+
     # Determine routing action
     action_map = {
         "WARM":           "accelerate"        if record["score"] >= 30 else "continue",
@@ -243,20 +236,26 @@ def process_inbound_reply(lead_id: str, reply_text: str) -> dict:
     }
 
     result = {
-        "sentiment": sentiment,
-        "score":     record["score"],
-        "band":      record["band"],
-        "action":    action_map.get(sentiment, "continue"),
-        "lead_id":   str(lead_id),
+        "sentiment":    sentiment,
+        "score":        record["score"],
+        "score_before": score_before,
+        "band":         record["band"],
+        "action":       action_map.get(sentiment, "continue"),
+        "lead_id":      str(lead_id),
     }
 
     log.info(f"Reply processed [{lead_id}]: sentiment={sentiment} "
-             f"score={record['score']} action={result['action']}")
+             f"score={score_before}→{record['score']} action={result['action']}")
     return result
 
 
 if __name__ == "__main__":
-    # Quick test
+    # Quick test — NOTE: update_score() and process_inbound_reply() now read/write
+    # lead_state in Postgres. If lead_id "TEST_001" doesn't already exist there
+    # (i.e. intake_lead() was never called for it), update_score() will log a
+    # warning and no-op, and score/band will just stay at the defaults (10/COLD).
+    # This still exercises classify_sentiment() and the routing logic correctly —
+    # it just won't show real score deltas without a real lead_state row.
     test_replies = [
         "Ok looks interesting, tell me more about the yield",
         "Need to think about it, EMI seems high",

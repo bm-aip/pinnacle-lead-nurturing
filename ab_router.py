@@ -12,8 +12,11 @@ Active tests:
 
 After 50 responses per variant:
   - Auto-promote winner (higher reply rate)
-  - Log result to ab_log.json
-  - Nurturer reads active_variants.json for current assignments
+  - Log result to ab_log.json (still file-based — low volume, read by Campaign Intelligence)
+  - Variant ASSIGNMENT now lives in lead_state (Postgres) via db.schema —
+    this is the source of truth sequence_scheduler reads from.
+  - record_outcome() still aggregates into ab_log.json / active_variants.json
+    for the Campaign Intelligence weekly summary.
 """
 
 import os
@@ -24,15 +27,36 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-AB_FILE      = os.environ.get("AB_FILE",      "data/ab_assignments.json")
-AB_LOG_FILE  = os.environ.get("AB_LOG_FILE",  "data/ab_log.json")
-VARIANTS_FILE= os.environ.get("VARIANTS_FILE","data/active_variants.json")
+import db.schema as db
+
+AB_LOG_FILE   = os.environ.get("AB_LOG_FILE",   "data/ab_log.json")
+VARIANTS_FILE = os.environ.get("VARIANTS_FILE", "data/active_variants.json")
 
 MIN_SAMPLE = 50  # minimum responses per variant before declaring winner
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
+
+# ── File helpers ──────────────────────────────────────────────────────────────
+# Used only for the low-volume aggregate test-outcome logs (ab_log.json,
+# active_variants.json) — NOT for per-lead variant assignment, which now
+# lives in lead_state (Postgres). See assign_variants()/get_variant() below.
+
+def _load(path: str) -> dict:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _save(path: str, data: dict):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 # ── Test definitions ──────────────────────────────────────────────────────────
 
@@ -54,50 +78,50 @@ TESTS = {
     },
 }
 
-# ── File helpers ──────────────────────────────────────────────────────────────
-
-def _load(path: str) -> dict:
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-def _save(path: str, data: dict):
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-
 # ── Variant assignment ────────────────────────────────────────────────────────
 
 def assign_variants(lead_id: str) -> dict:
     """
     Assign lead to A or B for each active test.
-    Assignment is random 50/50 and persisted — same lead always gets same variant.
+    Assignment is random 50/50.
+
+    NOTE: This function only COMPUTES the assignment — it does not write
+    to lead_state itself. sequence_scheduler.intake_lead() takes the returned
+    dict and writes ab_variant_day3 / ab_variant_day1 / ab_variant_visit
+    columns as part of the single upsert_lead_state() call, so there's one
+    write path for new lead intake instead of two.
+
     Returns {test_id: variant_letter} dict.
     """
-    assignments = _load(AB_FILE)
     lid = str(lead_id)
 
-    if lid not in assignments:
-        assignments[lid] = {
-            test_id: random.choice(["A", "B"])
-            for test_id in TESTS
+    # If lead already exists in lead_state, reuse its existing assignment
+    # (same lead must always get the same variant).
+    existing = db.get_lead_state(lid)
+    if existing and existing.get("ab_variant_day3"):
+        return {
+            "TEST_DAY3_MESSAGE": existing.get("ab_variant_day3"),
+            "TEST_DAY1_VIDEO":   existing.get("ab_variant_day1"),
+            "TEST_SITE_VISIT":   existing.get("ab_variant_visit"),
         }
-        assignments[lid]["assigned_at"] = datetime.now(timezone.utc).isoformat()
-        _save(AB_FILE, assignments)
-        log.info(f"AB assigned [{lid}]: {assignments[lid]}")
 
-    return {k: v for k, v in assignments[lid].items() if k in TESTS}
+    assignment = {test_id: random.choice(["A", "B"]) for test_id in TESTS}
+    log.info(f"AB assigned [{lid}]: {assignment}")
+    return assignment
 
 
 def get_variant(lead_id: str, test_id: str) -> Optional[str]:
-    """Get variant letter (A or B) for a specific test."""
-    assignments = _load(AB_FILE)
-    return assignments.get(str(lead_id), {}).get(test_id)
+    """Get variant letter (A or B) for a specific test, reading from lead_state."""
+    lead = db.get_lead_state(str(lead_id))
+    if not lead:
+        return None
+    col_map = {
+        "TEST_DAY3_MESSAGE": "ab_variant_day3",
+        "TEST_DAY1_VIDEO":   "ab_variant_day1",
+        "TEST_SITE_VISIT":   "ab_variant_visit",
+    }
+    col = col_map.get(test_id)
+    return lead.get(col) if col else None
 
 
 def get_variant_value(lead_id: str, test_id: str) -> Optional[str]:
@@ -217,10 +241,12 @@ def get_ab_summary() -> str:
 
 
 if __name__ == "__main__":
-    # Test assignment
+    # Smoke test — NOTE: assign_variants() only computes an assignment.
+    # In production, sequence_scheduler.intake_lead() writes it to lead_state
+    # in the same upsert as the rest of the lead row. Calling assign_variants()
+    # standalone here (with no lead_state row) will just show a fresh random
+    # 50/50 pick each run, not a persisted one.
     test_id = "TEST_LEAD_001"
     variants = assign_variants(test_id)
-    print(f"Assigned variants: {variants}")
-    print(f"Day 3 message variant: {get_variant_value(test_id, 'TEST_DAY3_MESSAGE')}")
-    print(f"Day 1 video variant: {get_variant_value(test_id, 'TEST_DAY1_VIDEO')}")
+    print(f"Computed variants (not yet persisted — needs intake_lead()): {variants}")
     print(get_ab_summary())

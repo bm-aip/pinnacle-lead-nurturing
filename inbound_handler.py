@@ -11,6 +11,12 @@ Handles:
   - Images/docs   → HIGH_INTENT flag → immediate Escalator
   - Videos        → acknowledge + flag for human review
 
+Lead lookup is now by phone via lead_state (Postgres) — db.get_lead_by_phone() —
+instead of the old JSON lead_registry.json file. Every inbound event is logged
+to inbound_log, and lead_state.status is updated according to the routing
+decision so the sequence clock (sequence_scheduler.tick()) picks up the
+correct next action on its next cycle.
+
 Run as Flask endpoint alongside the main poller.
 WasenderAPI webhook URL: POST /webhook/inbound
 """
@@ -22,6 +28,8 @@ import requests
 import tempfile
 from pathlib import Path
 from flask import Flask, request, jsonify
+
+import db.schema as db
 from scorer import process_inbound_reply, update_score
 from ab_router import record_outcome
 
@@ -31,52 +39,19 @@ WASENDER_SESSION   = os.environ.get("WASENDER_SESSION_ID", "")
 WASENDER_BASE_URL  = "https://api.wasenderapi.com/api"
 SALES_LINE         = os.environ.get("SALES_LINE_PHONE", "919840097140")
 
-_DATA_DIR = os.environ.get("DATA_DIR",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data"))
-os.makedirs(_DATA_DIR, exist_ok=True)
-
-QUEUE_PATH         = os.environ.get("QUEUE_PATH",
-    os.path.join(_DATA_DIR, "pinnacle_lead_queue.jsonl"))
-INBOUND_LOG        = os.environ.get("INBOUND_LOG",
-    os.path.join(_DATA_DIR, "inbound_log.jsonl"))
-
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ── Lead registry (phone → lead_id) ──────────────────────────────────────────
+# ── Lead lookup (phone → lead_state row, via Postgres) ───────────────────────
+# Replaces the old JSON lead_registry.json file. A lead only exists here once
+# sequence_scheduler.intake_lead() has run for it.
 
-LEAD_REGISTRY_FILE = os.environ.get("LEAD_REGISTRY_FILE",
-    os.path.join(_DATA_DIR, "lead_registry.json"))
-
-def get_lead_id_from_phone(phone: str) -> str:
-    """Look up lead_id from phone number."""
-    try:
-        registry = json.loads(Path(LEAD_REGISTRY_FILE).read_text())
-        # Normalise phone
-        digits = "".join(filter(str.isdigit, str(phone)))
-        if digits.startswith("91") and len(digits) == 12:
-            digits = digits[2:]
-        return registry.get(digits, registry.get(phone, "UNKNOWN"))
-    except Exception:
-        return "UNKNOWN"
-
-
-def register_lead(lead_id: str, phone: str):
-    """Register a lead_id → phone mapping."""
-    try:
-        path = Path(LEAD_REGISTRY_FILE)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        registry = json.loads(path.read_text()) if path.exists() else {}
-        digits = "".join(filter(str.isdigit, str(phone)))
-        if digits.startswith("91") and len(digits) == 12:
-            digits = digits[2:]
-        registry[digits] = lead_id
-        path.write_text(json.dumps(registry, indent=2))
-    except Exception as e:
-        log.error(f"Failed to register lead: {e}")
+def get_lead_from_phone(phone: str) -> dict:
+    """Look up the full lead_state row from phone number. Returns {} if not found."""
+    return db.get_lead_by_phone(phone)
 
 # ── Sarvam voice transcription ────────────────────────────────────────────────
 
@@ -175,25 +150,68 @@ def send_whatsapp_text(phone: str, message: str):
         log.error(f"Failed to send WhatsApp to {phone}: {e}")
 
 
-def write_inbound_log(event: dict):
-    """Append inbound event to log file."""
-    path = Path(INBOUND_LOG)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+def _log_and_route(
+    lead: dict,
+    phone: str,
+    msg_type: str,
+    reply_text: str,
+    result: dict,
+    audio_transcript: str = None,
+):
+    """
+    Single place that:
+      1. Writes the inbound event to inbound_log
+      2. Applies the lead_state status transition for the routing decision
 
+    `result` is the dict returned by scorer.process_inbound_reply():
+      {sentiment, score, score_before, band, action, lead_id}
 
-def write_routing_queue(action: str, lead_id: str, data: dict):
-    """Write a routing instruction to the main queue for agents to pick up."""
-    event = {
-        "source":    "inbound_handler",
-        "action":    action,
-        "lead_id":   lead_id,
-        "data":      data,
-        "ts":        __import__("datetime").datetime.utcnow().isoformat(),
-    }
-    with open(QUEUE_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    Routing → lead_state.status mapping:
+      continue           → leave status as "active" (sequence clock keeps going)
+      accelerate         → status stays "active"; next_msg_due_at is NOT
+                            pulled forward here — the next tick() will see
+                            the now-higher score_band and may fast-track if HOT
+      objection_handler   → status = "objection_handler" (Nurturer's normal
+                            sequence pauses; objection-handling agent works
+                            the lead in Paperclip, then a human/agent flips
+                            status back to "active" once resolved)
+      escalate            → status = "escalated" (Escalator owns it now)
+      mark_lost           → status = "lost" (sequence clock stops)
+    """
+    lead_id = lead.get("lead_id", "UNKNOWN")
+
+    db.log_inbound(
+        lead_id=lead_id,
+        phone=phone,
+        message_type=msg_type,
+        reply_text=reply_text,
+        sentiment=result.get("sentiment"),
+        routing_decision=result.get("action"),
+        score_before=result.get("score_before"),
+        score_after=result.get("score"),
+        audio_transcript=audio_transcript,
+    )
+
+    action = result.get("action")
+
+    if not lead_id or lead_id == "UNKNOWN":
+        log.warning(f"_log_and_route: no matching lead_state row for phone {phone} — logged but not routed")
+        return
+
+    if action == "mark_lost":
+        db.update_lead_state(lead_id, {"status": "lost"})
+    elif action == "escalate":
+        db.update_lead_state(lead_id, {"status": "escalated"})
+    elif action == "objection_handler":
+        db.update_lead_state(lead_id, {"status": "objection_handler"})
+    elif action == "accelerate":
+        # Status stays active — score_band is already updated by process_inbound_reply().
+        # The next tick() picks up the new band (HOT fast-tracks to Scheduler).
+        pass
+    # "continue" — no status change needed
+
+    log.info(f"Routed [{lead_id}] action={action} → lead_state.status updated accordingly")
+
 
 # ── Webhook endpoint ──────────────────────────────────────────────────────────
 
@@ -223,87 +241,76 @@ def inbound_webhook():
     # Extract sender phone
     from_jid = msg.get("from", "")
     phone    = from_jid.replace("@s.whatsapp.net", "").replace("@c.us", "")
-    lead_id  = get_lead_id_from_phone(phone)
+    lead     = get_lead_from_phone(phone)
+    lead_id  = lead.get("lead_id", "UNKNOWN")
     msg_type = msg.get("type", "text")
 
     log.info(f"Inbound [{msg_type}] from {phone} (lead_id={lead_id})")
 
-    event = {
-        "ts":       __import__("datetime").datetime.utcnow().isoformat(),
-        "phone":    phone,
-        "lead_id":  lead_id,
-        "type":     msg_type,
-    }
+    final_action = "none"
 
     # ── Text message ──────────────────────────────────────────────────────────
     if msg_type == "text":
         reply_text = msg.get("text", {}).get("body", "").strip()
-        event["text"] = reply_text
 
-        # Score + sentiment
-        result = process_inbound_reply(lead_id, reply_text)
-        event["sentiment"] = result["sentiment"]
-        event["action"]    = result["action"]
+        if lead_id == "UNKNOWN":
+            # No matching lead_state row for this phone — log raw and stop.
+            # (Most likely: inbound arrived before intake_lead() ran for this
+            # lead, or the number isn't in our pipeline at all.)
+            final_action = "unmatched_phone"
+            db.log_inbound(
+                lead_id=lead_id, phone=phone, message_type="text",
+                reply_text=reply_text, sentiment=None,
+                routing_decision="unmatched_phone",
+                score_before=None, score_after=None,
+            )
+            log.warning(f"Inbound text from unmatched phone {phone} — no lead_state row")
+        else:
+            # Score + sentiment + lead_state update (last_reply_text/at/sentiment)
+            result = process_inbound_reply(lead_id, reply_text)
+            final_action = result["action"]
 
-        # Record A/B outcome
-        record_outcome(lead_id, "TEST_DAY3_MESSAGE",
-                       "replied" if result["sentiment"] != "OPT_OUT" else "opted_out")
+            # Record A/B outcome
+            record_outcome(lead_id, "TEST_DAY3_MESSAGE",
+                           "replied" if result["sentiment"] != "OPT_OUT" else "opted_out")
 
-        # Route based on action
-        if result["action"] == "mark_lost":
-            write_routing_queue("mark_lost", lead_id, {
-                "reason": "opt_out",
-                "phone":  phone,
-                "reply":  reply_text,
-            })
-        elif result["action"] == "escalate":
-            write_routing_queue("escalate", lead_id, {
-                "trigger":  "near_close_signal",
-                "phone":    phone,
-                "reply":    reply_text,
-                "score":    result["score"],
-            })
-        elif result["action"] == "objection_handler":
-            write_routing_queue("objection_handler", lead_id, {
-                "phone":     phone,
-                "reply":     reply_text,
-                "sentiment": result["sentiment"],
-            })
-        elif result["action"] == "accelerate":
-            write_routing_queue("accelerate", lead_id, {
-                "phone":  phone,
-                "score":  result["score"],
-                "band":   result["band"],
-            })
-        # NEUTRAL / continue — no routing action needed, poller handles next step
+            _log_and_route(lead, phone, "text", reply_text, result)
 
     # ── Voice note ────────────────────────────────────────────────────────────
     elif msg_type == "audio":
         audio_url = msg.get("audio", {}).get("url", "")
-        event["audio_url"] = audio_url
 
         # Transcribe
         transcript = transcribe_voice_note(audio_url) if audio_url else ""
-        event["transcript"] = transcript
 
         if transcript:
-            # Treat transcript as text reply
-            result = process_inbound_reply(lead_id, transcript)
-            event["sentiment"] = result["sentiment"]
-            event["action"]    = result["action"]
-
-            write_routing_queue("inbound_voice", lead_id, {
-                "phone":      phone,
-                "transcript": transcript,
-                "sentiment":  result["sentiment"],
-                "action":     result["action"],
-            })
+            if lead_id == "UNKNOWN":
+                final_action = "unmatched_phone"
+                db.log_inbound(
+                    lead_id=lead_id, phone=phone, message_type="audio",
+                    reply_text="", sentiment=None,
+                    routing_decision="unmatched_phone",
+                    score_before=None, score_after=None,
+                    audio_transcript=transcript,
+                )
+                log.warning(f"Inbound audio from unmatched phone {phone} — no lead_state row")
+            else:
+                # Treat transcript as text reply
+                result = process_inbound_reply(lead_id, transcript)
+                final_action = result["action"]
+                _log_and_route(lead, phone, "audio", transcript, result,
+                                audio_transcript=transcript)
         else:
-            # Transcription failed — flag for human review
-            write_routing_queue("voice_transcription_failed", lead_id, {
-                "phone":     phone,
-                "audio_url": audio_url,
-            })
+            # Transcription failed — flag for human review, log with no routing
+            final_action = "voice_transcription_failed"
+            db.log_inbound(
+                lead_id=lead_id, phone=phone, message_type="audio",
+                reply_text="", sentiment=None,
+                routing_decision="voice_transcription_failed",
+                score_before=None, score_after=None,
+            )
+            if lead_id != "UNKNOWN":
+                db.update_lead_state(lead_id, {"status": "human_review"})
             # Send acknowledgement to lead
             send_whatsapp_text(phone,
                 "Thanks for the voice note! Give me a moment to listen — "
@@ -312,11 +319,19 @@ def inbound_webhook():
     # ── Image or document ─────────────────────────────────────────────────────
     elif msg_type in ("image", "document"):
         file_url = msg.get(msg_type, {}).get("url", "")
-        event["file_url"] = file_url
-        event["action"]   = "escalate_high_intent"
+        final_action = "escalate_high_intent"
 
         # Sending a document (bank statement, property deed, etc.) = near-close signal
         update_score(lead_id, "lead_near_close", {"trigger": f"sent_{msg_type}"})
+
+        db.log_inbound(
+            lead_id=lead_id, phone=phone, message_type=msg_type,
+            reply_text=f"[sent {msg_type}: {file_url or 'see WhatsApp'}]",
+            sentiment="NEAR_CLOSE", routing_decision="escalate",
+            score_before=None, score_after=None,
+        )
+        if lead_id != "UNKNOWN":
+            db.update_lead_state(lead_id, {"status": "escalated"})
 
         # Immediate escalation alert to sales line
         alert = (
@@ -332,25 +347,21 @@ def inbound_webhook():
             "Thanks for sharing that! Our senior team will review and "
             "reach out to you shortly.")
 
-        write_routing_queue("escalate", lead_id, {
-            "trigger":  f"sent_{msg_type}",
-            "phone":    phone,
-            "file_url": file_url,
-        })
-
     # ── Video ─────────────────────────────────────────────────────────────────
     elif msg_type == "video":
-        event["action"] = "flag_human_review"
-        write_routing_queue("human_review", lead_id, {
-            "phone":  phone,
-            "reason": "lead_sent_video",
-        })
+        final_action = "flag_human_review"
+        db.log_inbound(
+            lead_id=lead_id, phone=phone, message_type="video",
+            reply_text="[sent video]", sentiment=None,
+            routing_decision="human_review",
+            score_before=None, score_after=None,
+        )
+        if lead_id != "UNKNOWN":
+            db.update_lead_state(lead_id, {"status": "human_review"})
         send_whatsapp_text(phone,
             "Thanks for sharing! Our team will take a look and get back to you.")
 
-    # ── Log everything ────────────────────────────────────────────────────────
-    write_inbound_log(event)
-    return jsonify({"status": "processed", "action": event.get("action", "none")}), 200
+    return jsonify({"status": "processed", "action": final_action}), 200
 
 
 @app.route("/health", methods=["GET"])
